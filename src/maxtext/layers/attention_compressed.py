@@ -786,7 +786,7 @@ class DeepseekV4Indexer(nnx.Module):
       model_mode: str = MODEL_MODE_TRAIN,
       cache: Optional[Any] = None,
       return_scores: bool = False,
-  ) -> Array | Tuple[Array, Array]:
+  ) -> Tuple[Array, Optional[Array]]:
     """Forward pass for the DeepSeek-V4 Indexer.
 
     Args:
@@ -880,9 +880,7 @@ class DeepseekV4Indexer(nnx.Module):
 
     if compressed_len == 0:
       empty_indices = jnp.zeros((batch_size, seq_len, min(self.index_topk, compressed_len)), dtype=jnp.int32)
-      if return_scores:
-        return empty_indices, jnp.zeros((batch_size, seq_len, 0), dtype=jnp.float32)
-      return empty_indices
+      return empty_indices, (jnp.zeros((batch_size, seq_len, 0), dtype=jnp.float32) if return_scores else None)
 
     # --- TOP-K ROUTING MATH (Executes in both Prefill and AR) ---
     compressed_kv = jnp.expand_dims(compressed, axis=1)
