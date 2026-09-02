@@ -20,7 +20,7 @@ the MaxRL AbstractTrainer interface without running an outer loop.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import dataclasses
 import os
 from typing import Any
@@ -191,23 +191,13 @@ def router_replay_gen_model_input_fn(
     `targets_segmentation`, and (when present) `forced_routed_experts`.
   """
   token_ids = jnp.asarray(payload.token_ids)
-  token_mask = (
-      jnp.asarray(payload.token_mask)
-      if payload.token_mask is not None
-      else jnp.ones_like(token_ids)
-  )
-  segment_ids = (
-      jnp.asarray(payload.segment_ids)
-      if payload.segment_ids is not None
-      else token_mask
-  )
+  token_mask = jnp.asarray(payload.token_mask) if payload.token_mask is not None else jnp.ones_like(token_ids)
+  segment_ids = jnp.asarray(payload.segment_ids) if payload.segment_ids is not None else token_mask
 
   # TrainerPayload rows are left-padded prompt + right-padded completion, so a
   # plain arange would give the first real token a nonzero RoPE position and
   # shift every token relative to the rollout that produced the routing.
-  positions = jnp.maximum(jnp.cumsum(token_mask != 0, axis=-1) - 1, 0).astype(
-      jnp.int32
-  )
+  positions = jnp.maximum(jnp.cumsum(token_mask != 0, axis=-1) - 1, 0).astype(jnp.int32)
 
   # roll(-1) wraps token 0 into the last position, which is not its real next
   # token; mask that position out instead of training on the wrap-around. Do
@@ -215,9 +205,7 @@ def router_replay_gen_model_input_fn(
   # different sequence.
   targets_segmentation = token_mask.at[:, -1].set(0)
   same_segment = segment_ids[:, :-1] == segment_ids[:, 1:]
-  targets_segmentation = targets_segmentation.at[:, :-1].multiply(
-      same_segment.astype(token_mask.dtype)
-  )
+  targets_segmentation = targets_segmentation.at[:, :-1].multiply(same_segment.astype(token_mask.dtype))
 
   kwargs = {
       "inputs": token_ids,
@@ -278,9 +266,7 @@ def make_router_replay_loss_fn(
     }
     if forced_routed_experts is not None:
       data["forced_routed_experts"] = forced_routed_experts
-    return maxtext_train.loss_fn(
-        model, config, data, dropout_rng=dropout_rng, params=None, is_train=True
-    )
+    return maxtext_train.loss_fn(model, config, data, dropout_rng=dropout_rng, params=None, is_train=True)
 
   return router_replay_loss_fn
 
@@ -312,6 +298,8 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       TypeError: If training_config is not a pyconfig.HyperParameters instance.
       ValueError: If training_config.model_name is not specified or empty, or if `wrap_with_tunix_adapter`
         is requested without `tokenizer_pad_id` or without a `mesh`.
+      NotImplementedError: If `training_config.lora.enable_lora` is True. This engine has no LoRA
+        path and would otherwise full-finetune the base model while the config claims LoRA.
     """
     if not isinstance(training_config, pyconfig.HyperParameters):
       raise TypeError(
@@ -325,6 +313,13 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
         )
       if mesh is None:
         raise ValueError("wrap_with_tunix_adapter=True requires a mesh; the adapter is built under it.")
+
+    # This engine has no LoRA path
+    if getattr(getattr(training_config, "lora", None), "enable_lora", False):
+      raise NotImplementedError(
+          "MaxTextTrainingEngine does not support LoRA, but lora.enable_lora=True was set. "
+          "This engine trains all parameters, set lora.enable_lora=False to train with this engine."
+      )
     self._config = training_config
     self._mesh = mesh
     self._init_rng = jax.random.PRNGKey(training_config.init_weights_seed)
@@ -365,11 +360,14 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     self._state: Any = None
     self._accumulated_grads: Any = None
     self._micro_step_count = 0
+    # Set when this run resumed from an intra-step checkpoint, cleared once the step it
+    # resumed into completes and its finished state has been checkpointed.
+    self._resumed_mid_step = False
     self._cached_losses: list[abstract_engine.WeightedMetric | jax.Array] = []
     # `create_training_optimizer` returns a raw optax GradientTransformation. `TrainStateNNX.apply_gradients`
     # calls `optimizer.update(model, grads)`, which is the nnx.Optimizer signature, and
-    # `checkpointing.CheckpointState` expects an nnx.Optimizer too, so wrap it here. This engine is only
-    # driven via tunix's GRPO+Raiden integration, which never enables LoRA, so `wrt` is always `nnx.Param`.
+    # `checkpointing.CheckpointState` expects an nnx.Optimizer too, so wrap it here. `wrt=nnx.Param`
+    # covers every parameter, which is correct only because LoRA is rejected above.
     self._learning_rate_schedule, tx = train_utils.create_training_optimizer(self._config, self._model)
     self._optimizer = nnx.Optimizer(self._model, tx, wrt=nnx.Param)
     self._train_step: int = 0
@@ -579,12 +577,13 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
             lambda g: g / micro_step_count,
             accumulated_grads,
         )
+      grad_norm = max_utils.l2norm_pytree(grads)
       if self._config.gradient_clipping_threshold > 0:
         grads = maxtext_utils.apply_gradient_clipping(grads, None, self._config.gradient_clipping_threshold)
+
       local_state = nnx.merge(self._state_graphdef, state_pure, copy=True)
       if hasattr(local_state, "apply_gradients"):
         if self._config.skip_step_on_spikes:
-          grad_norm = max_utils.l2norm_pytree(grads)
           local_state.apply_gradients(grads, loss=mean_loss, grad_norm=grad_norm)
           opt_obj = getattr(local_state, "optimizer", self._optimizer)
           if opt_obj is not None:
@@ -896,6 +895,14 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     self._accumulated_grads = None
     self._micro_step_count = 0
     self._train_step += 1
+
+    if self._resumed_mid_step:
+      # This is the step the run resumed into, and it just finished. The checkpoint on disk
+      # for it is still the partial one. Orbax's save-interval policy will not save this step
+      # again.
+      self._resumed_mid_step = False
+      self.save_checkpoint(metadata={"step": self.train_step}, force=True)
+
     return self.train_step
 
   def eval_step(self, payload: abstract_engine.TrainerPayload, **kwargs: Any) -> None:
@@ -932,21 +939,25 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     # Drain all inflight computations and log pending metrics before checkpointing.
     self._throttler.wait_for_all()
 
-    step = kwargs.get("step", self.train_step)
-    force_ckpt_save = kwargs.get("force", False)
+    step = kwargs.pop("step", None)
+    if step is None and isinstance(metadata, Mapping):
+      step = metadata.get("step")
+    if step is None:
+      # checkpoint for incomplete train step is saved for self.train_step+1
+      # because update() is not called yet to increment train_step;
+      # checkpoint for completed step is saved for self.train_step because update() increments train_step
+      step = self.train_step + 1 if self._micro_step_count > 0 else self.train_step
 
-    custom_metadata = {}
     if self._micro_step_count > 0:
       logging.info(
           "Saving intra-step checkpoint at step %d (micro_step_count=%d).",
           step,
           self._micro_step_count,
       )
-      force_ckpt_save = True
-      custom_metadata["micro_step_count"] = self._micro_step_count
     else:
       logging.info("Saving checkpoint at step %d.", step)
 
+    custom_metadata = {}
     if metadata:
       # Metadata from Orchestrator
       custom_metadata["additional_metadata"] = metadata
@@ -960,9 +971,12 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
             # a list, and restore_checkpoint iterates it back into the recorder's buffer.
             accumulated_metrics=self._metrics_recorder.get_metrics_history(clear_cache=False),
             accumulated_grads=self._accumulated_grads,
+            # Recorded by the CheckpointManager into custom_metadata, so that a later save
+            # at this same step can tell it supersedes this one.
+            micro_step_count=self._micro_step_count,
         ),
         custom_metadata=custom_metadata,
-        force_ckpt_save=force_ckpt_save,
+        **kwargs,
     )
     if ckpt_saved:
       logging.info("Checkpoint saved at step %d.", step)
@@ -991,7 +1005,6 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       return None
 
     logging.info("Checkpoint restored from step %d.", restored_step)
-    self.train_step = restored_step
 
     if restored_checkpoint_state.accumulated_metrics:
       buffers = []
@@ -1018,15 +1031,35 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       self._metrics_recorder._metrics_buffer = buffers
 
     restored_additional_metadata = None
+    # Checkpoint with no metadata says nothing about how far into its step it
+    # got, and must not inherit the count from whatever this engine was doing before.
+    self._micro_step_count = 0
     if restored_metadata:
       self._micro_step_count = restored_metadata.get("micro_step_count", 0)
       restored_additional_metadata = restored_metadata.get("additional_metadata", None)
 
-    # Restore intra-step state if it exists.
-    if restored_checkpoint_state.accumulated_grads:
+    if self._micro_step_count > 0:
+      logging.info(
+          "Restored intra-step checkpoint at step %d (micro_step_count=%d).",
+          restored_step,
+          self._micro_step_count,
+      )
+      # update() will increment the step after applying the accumulated gradients
+      self.train_step = restored_step - 1
+      # The checkpoint at `restored_step` holds a partially accumulated step. Once that step
+      # completes, `update` replaces it with the finished state.
+      self._resumed_mid_step = True
+    else:
+      self.train_step = restored_step
+      self._resumed_mid_step = False
+
+    # Restore intra-step state if it exists. Gated on the count because for a complete step
+    # `restored_checkpoint_state.accumulated_grads` is just the value this engine passed in
+    # above, which the branch above has already discarded.
+    if self._micro_step_count > 0 and restored_checkpoint_state.accumulated_grads:
       self._accumulated_grads = restored_checkpoint_state.accumulated_grads
 
-      if self._micro_step_count > 0 and self._metrics_recorder._metrics_buffer:  # pylint: disable=protected-access
+      if self._metrics_recorder._metrics_buffer:  # pylint: disable=protected-access
         active_buf = self._metrics_recorder.get_step_metrics(restored_step)
         if active_buf and "loss" in active_buf.weighted_metrics:
           wm = active_buf.weighted_metrics["loss"]
@@ -1163,9 +1196,10 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     """
     if staging_transport == "raiden":
       try:
-        from tunix.experimental.worker import raiden_synchronizer  # pylint: disable=g-import-not-at-top,import-outside-toplevel
+        # pylint: disable=g-import-not-at-top,import-outside-toplevel
+        from tunix.experimental.weight_sync import raiden_synchronizer
       except ImportError:
-        logging.warning("tunix.experimental.worker.raiden_synchronizer not found; returning empty metadata.")
+        logging.warning("tunix.experimental.weight_sync.raiden_synchronizer not found; returning empty metadata.")
         return []
 
       # 1. Drain all in-flight TPU computations to ensure weights are fully updated
@@ -1265,12 +1299,18 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     return True
 
   def close(self) -> None:
-    """Closes the trainer and its associated resources."""
+    """Closes the trainer, writes buffered metrics and final checkpoint."""
     if self._raiden_syncs:
       for sync in self._raiden_syncs:
         if hasattr(sync, "close"):
           sync.close()
       self._raiden_syncs = None
-    self._throttler.cleanup()
-    self._metrics_recorder.cleanup()
+
+    self.save_checkpoint(metadata=None, force=True)
     self._checkpoint_manager.close()
+
+    # Write the metrics and cleanup metrics logger resources
+    self._throttler.cleanup()
+
+    # Cleanup metrics recorder resources after saving the checkpoint, ensuring all buffered metrics are saved properly
+    self._metrics_recorder.cleanup()
