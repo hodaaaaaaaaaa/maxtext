@@ -436,6 +436,10 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       "mtp_loss": mtp_loss,
       "batch_stats": (intermediate_outputs.get("batch_stats", None) if hasattr(intermediate_outputs, "get") else None),
   }
+  if getattr(config, "retry_when_tokens_dropped", False):
+    moe_overflows = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "moe_has_overflow")
+    has_moe_overflow = jnp.any(jnp.array([jnp.any(x) for x in moe_overflows])) if moe_overflows else False
+    aux["has_moe_overflow"] = jnp.asarray(has_moe_overflow, dtype=jnp.float32)
   return loss, aux
 
 
@@ -576,6 +580,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   xent_sum = aux["xent_sum"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
+  has_moe_overflow = aux.get("has_moe_overflow")
   indexer_loss = aux.get("indexer_loss", 0.0)
   z_loss = aux.get("z_loss", 0.0)
   moe_bias_updates = aux.get("moe_bias_updates")
@@ -765,6 +770,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "scalar": scalar_metrics,
       "scalars": {},
   }
+  if has_moe_overflow is not None:
+    metrics["has_moe_overflow"] = has_moe_overflow
   if getattr(config, "record_internal_nn_metrics", False):
     record_activation_metrics(metrics, intermediate_outputs, config)
 
@@ -880,6 +887,13 @@ def training_loop_iteration(
         if shard_optimizer_over_data and isinstance(model, nn.Module):
           state = sharding.maybe_shard_with_name(state, state_mesh_shardings, shard_mode)
         state, metrics = p_train_step(state, example_batch, *step_rng_args)
+
+  if config.retry_when_tokens_dropped:
+    # DEBUG: remove the else branch once verified.
+    if bool(metrics.get("has_moe_overflow", False)):
+      max_logging.log(f"Step {step}: MoE ragged buffer overflow, layer(s) fell back to a dropless buffer.")
+    else:
+      max_logging.log(f"Step {step}: no MoE ragged buffer overflow.")
 
   step_time_delta = datetime.datetime.now() - last_step_completion
   last_step_completion = datetime.datetime.now()

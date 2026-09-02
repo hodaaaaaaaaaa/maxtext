@@ -1088,6 +1088,15 @@ class TestGetFunctionalTrainWithSignature(unittest.TestCase):
     )
     self.assertEqual(donate_argnums, 0)
 
+  def test_donate_argnums_is_zero_with_retry_when_tokens_dropped(self):
+    step = self._make_mock_step()
+    cfg = self._make_mock_config()
+    cfg.retry_when_tokens_dropped = True
+    _, _, _, _, donate_argnums = maxtext_utils.get_functional_train_with_signature(
+        step, "data_sharding", "state_shardings", "model", cfg
+    )
+    self.assertEqual(donate_argnums, 0)
+
   def test_functional_train_is_partial(self):
     """functional_train should partially apply model and config."""
     received = {}
