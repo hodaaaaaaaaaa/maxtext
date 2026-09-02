@@ -665,7 +665,7 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
 
 
 class DeepseekV4Indexer(nnx.Module):
-  """Indexer module for Compressed Sparse Attention (DeepSeek-V4 paper Section 2.3.1).
+  """Indexer module for Compressed Sparse Attention (DeepSeek-V4 paper §2.3.1).
 
   Evaluates query representations against compressed KV blocks to identify the top-k
   most relevant blocks to attend to.
@@ -924,7 +924,7 @@ class DeepseekV4Indexer(nnx.Module):
 
 
 class DeepseekV4CSACompressor(BaseDeepseekCompressor):
-  """Compressed Sparse Attention compressor (DeepSeek-V4 paper Section 2.3.1).
+  """Compressed Sparse Attention compressor (DeepSeek-V4 paper §2.3.1).
 
   Uses overlapping windows to compress local sequence contexts into sparse blocks,
   which are dynamically selected by the Indexer for long-range sparse attention.
