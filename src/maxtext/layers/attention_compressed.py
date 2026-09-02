@@ -1776,8 +1776,14 @@ class CompressedAttention(Attention):
     Reference:
     DeepSeek-V4 (https://arxiv.org/abs/2606.19348):
       - Section 2.3.1 describes the Lightning Indexer and CSA forward architecture.
-      - Section 4.2.2 ("Training Setups") describes the 3-stage sparse attention pre-training pipeline
-        (1T token dense warm-up, CSA lightning indexer warm-up, and sparse pre-training).
+      - Section 4.2.2 ("Training Setups") describes the 3-stage sparse attention pre-training pipeline:
+        Stage 1 (Dense Pre-training, first 1T tokens):
+          use_indexer=False, indexer_loss_scaling_factor=0.0
+        Stage 2 (Lightning Indexer Warm-up):
+          use_indexer=True, indexer_sparse_training=False, indexer_loss_scaling_factor=1.0,
+          trainable_parameters_mask=['.*indexer.*']
+        Stage 3 (Sparse Pre-training):
+          use_indexer=True, indexer_sparse_training=True, indexer_loss_scaling_factor=1.0
     DeepSeek-V3.2 Section 2.1, Eqs. 3–4 (https://arxiv.org/abs/2512.02556) - DeepSeek Sparse Attention (DSA)
       KL divergence distillation loss, adapted here from uncompressed tokens to CSA compressed KV blocks.
 
