@@ -100,6 +100,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         f"q_lora_rank={self.q_lora_rank}",
         "o_groups=2",
         "o_lora_rank=16",
+        "enable_checkpointing=False",
     ]
     return pyconfig.initialize(argv)
 

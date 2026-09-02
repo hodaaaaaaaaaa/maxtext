@@ -3943,14 +3943,14 @@ class MaxTextConfig(
         )
       if self.q_lora_rank == 0:
         raise NotImplementedError("Sparse indexer has not implemented for q_lora_rank = 0.")
+      supports_dot_product = self.attention == "dot_product"
+      supports_flash_splash = self.attention == "flash" and self.use_tokamax_splash
+      if not (supports_dot_product or supports_flash_splash):
+        raise ValueError(
+            f"Sparse indexer with {self.attention_type} is only supported with dot_product attention or flash "
+            "attention with tokamax splash."
+        )
       if self.attention_type == AttentionType.MLA.value:
-        supports_dot_product = self.attention == "dot_product"
-        supports_flash_splash = self.attention == "flash" and self.use_tokamax_splash
-        if not (supports_dot_product or supports_flash_splash):
-          raise ValueError(
-              "Sparse indexer with MLA is only supported with dot_product attention or flash "
-              "attention with tokamax splash."
-          )
         if (
             self.attention == "flash"
             and self.context_parallel_strategy == "all_gather"
@@ -3967,6 +3967,7 @@ class MaxTextConfig(
               "short-circuits to select all tokens and no indexer loss is produced."
           )
       elif self.attention_type == AttentionType.COMPRESSED.value:
+        # DeepSeek-V4 CSA natively uses a compression rate of 4 for the indexer blocks.
         compress_rate = 4
         max_blocks = self.max_target_length // compress_rate
         if self.indexer_loss_scaling_factor > 0.0 and self.indexer_topk > max_blocks:
