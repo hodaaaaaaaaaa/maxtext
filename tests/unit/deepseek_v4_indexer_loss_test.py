@@ -70,6 +70,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
   def _get_config(
       self,
+      use_indexer=True,
       indexer_loss_scaling_factor=0.5,
       indexer_sparse_training=False,
       mla_qk_head_chunk_size=0,
@@ -84,7 +85,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         "decoder_block=deepseek4",
         "attention_type=compressed",
         "attention=dot_product",
-        "use_indexer=True",
+        f"use_indexer={use_indexer}",
         f"indexer_loss_scaling_factor={indexer_loss_scaling_factor}",
         f"indexer_sparse_training={indexer_sparse_training}",
         f"mla_qk_head_chunk_size={mla_qk_head_chunk_size}",
@@ -485,8 +486,8 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
       else:
         np.testing.assert_allclose(np.array(routed[:, 0, 15, :]), 0.0, atol=1e-5)
 
-  def test_default_scale_zero_computes_lm_loss_and_no_indexer_loss(self):
-    """Verify that with use_indexer=True and indexer_loss_scaling_factor=0.0, loss_fn computes normal LM loss."""
+  def test_pre_train_loss_fn_stages(self):
+    """Verify pre_train.loss_fn behavior across dense, warm-up, and sparse training stages."""
     data = {
         "inputs": jnp.zeros((self.batch_size, self.seq_len), dtype=jnp.int32),
         "inputs_position": jnp.broadcast_to(jnp.arange(self.seq_len), (self.batch_size, self.seq_len)),
@@ -494,25 +495,25 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         "targets": jnp.zeros((self.batch_size, self.seq_len), dtype=jnp.int32),
         "targets_segmentation": jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32),
     }
-    cfg_default = self._get_config(indexer_loss_scaling_factor=0.0, indexer_sparse_training=False)
-    mock_model = _MockNnxDecoder(vocab_size=cfg_default.vocab_size)
+    mock_model = _MockNnxDecoder(vocab_size=32)
 
-    # Case 1: Default configuration (use_indexer=True, scaling_factor=0.0, sparse_training=False)
+    # Stage 1: Standard dense pre-training (use_indexer=False)
     # Must compute normal LM loss (xent_sum > 0)
-    loss_default, aux_default = pre_train.loss_fn(mock_model, cfg_default, data, None, None, is_train=True)
-    self.assertGreater(float(aux_default["xent_sum"]), 0.0)
-    self.assertGreater(float(loss_default), 0.0)
+    cfg_dense = self._get_config(use_indexer=False, indexer_loss_scaling_factor=0.0, indexer_sparse_training=False)
+    loss_dense, aux_dense = pre_train.loss_fn(mock_model, cfg_dense, data, None, None, is_train=True)
+    self.assertGreater(float(aux_dense["xent_sum"]), 0.0)
+    self.assertGreater(float(loss_dense), 0.0)
 
-    # Case 2: Dense warm-up configuration (use_indexer=True, scaling_factor=1.0, sparse_training=False)
+    # Stage 2: Dense warm-up configuration (use_indexer=True, scaling_factor=1.0, sparse_training=False)
     # Must zero out main model LM loss (xent_sum == 0.0)
-    cfg_warmup = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=False)
+    cfg_warmup = self._get_config(use_indexer=True, indexer_loss_scaling_factor=1.0, indexer_sparse_training=False)
     _, aux_warmup = pre_train.loss_fn(mock_model, cfg_warmup, data, None, None, is_train=True)
     self.assertEqual(float(aux_warmup["xent_sum"]), 0.0)
     self.assertEqual(float(aux_warmup["z_loss"]), 0.0)
 
-    # Case 3: Sparse training configuration (use_indexer=True, scaling_factor=1.0, sparse_training=True)
+    # Stage 3: Sparse training configuration (use_indexer=True, scaling_factor=1.0, sparse_training=True)
     # Must compute normal LM loss (xent_sum > 0)
-    cfg_sparse = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=True)
+    cfg_sparse = self._get_config(use_indexer=True, indexer_loss_scaling_factor=1.0, indexer_sparse_training=True)
     loss_sparse, aux_sparse = pre_train.loss_fn(mock_model, cfg_sparse, data, None, None, is_train=True)
     self.assertGreater(float(aux_sparse["xent_sum"]), 0.0)
     self.assertGreater(float(loss_sparse), 0.0)

@@ -218,9 +218,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         **forced_routing_kwargs,
     )
 
-    if (
-        config.use_indexer and config.indexer_loss_scaling_factor > 0.0 and not config.indexer_sparse_training
-    ) and is_train:
+    if (config.use_indexer and not config.indexer_sparse_training) and is_train:
       # In Dense Warm-up stage, we skip main model loss calculation for efficiency.
       # The main model parameters are frozen and only the indexer is trained via KL divergence.
       xent_sum = 0.0
@@ -301,9 +299,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     if indexer_losses_state is not None:
       intermediate_outputs["indexer_losses"] = indexer_losses_state.to_pure_dict()
 
-    if (
-        config.use_indexer and config.indexer_loss_scaling_factor > 0.0 and not config.indexer_sparse_training
-    ) and is_train:
+    if (config.use_indexer and not config.indexer_sparse_training) and is_train:
       # In Dense Warm-up stage, we skip main model loss calculation for efficiency.
       # The main model parameters are frozen and only the indexer is trained via KL divergence.
       xent_sum = 0.0

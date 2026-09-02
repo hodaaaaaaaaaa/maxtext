@@ -1774,12 +1774,12 @@ class CompressedAttention(Attention):
     target_distribution = L1_Normalize(Sum_h(Softmax_w(Q @ K_comp^T + teacher_mask)))
 
     Reference:
-    DeepSeek-V4 Section 2.3.1 (https://arxiv.org/abs/2606.19348) - Equations 13–17 describe the Lightning
-      Indexer architecture, but the paper does not specify an explicit formula for the indexer loss,
-      deferring to the DSA training setup from DeepSeek-V3.2.
-    DeepSeek-V3.2 Section 2.1, Eqs. 3–4 (https://arxiv.org/abs/2512.02556) - Indexer KL divergence distillation loss.
-      While DeepSeek-V3.2 evaluates this loss over individual uncompressed tokens, what we do here for DeepSeek-V4 CSA
-      is evaluate this exact distillation formulation over the compressed KV blocks.
+    DeepSeek-V4 (https://arxiv.org/abs/2606.19348):
+      - Section 2.3.1 describes the Lightning Indexer and CSA forward architecture.
+      - Section 4.2.2 ("Training Setups") describes the 3-stage sparse attention pre-training pipeline
+        (1T token dense warm-up, CSA lightning indexer warm-up, and sparse pre-training).
+    DeepSeek-V3.2 Section 2.1, Eqs. 3–4 (https://arxiv.org/abs/2512.02556) - DeepSeek Sparse Attention (DSA)
+      KL divergence distillation loss, adapted here from uncompressed tokens to CSA compressed KV blocks.
 
     Args:
       indexer_score: Scores predicted by indexer [batch, q_len, compressed_len].

@@ -120,6 +120,52 @@ python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/base.yml \
     dataset_path=${DATASET_PATH?}
 ```
 
+### DeepSeek-V4 CSA Indexer Pre-training Stages
+
+As specified in the DeepSeek-V4 technical report (§4.2.2 "Training Setups"):
+> *"As for the setups of sparse attention, we first warmup the model with dense attention for the first 1T tokens, and introduce sparse attention at the sequence length of 64K and keep sparse attention during the rest of the training. When introducing attention sparsity, we first set a short stage to warm up the lightning indexer in CSA, and then train the model with sparse attention for most of the training."*
+
+These three pre-training stages are controlled in MaxText via flags:
+
+#### 1. Stage 1: Dense Pre-training (First 1T tokens, 4K–16K context)
+Standard pre-training with dense attention across all tokens before attention sparsity is introduced.
+```sh
+python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/base.yml \
+    src/maxtext/configs/models/deepseek4-284b.yml \
+    run_name=stage1_dense_pretraining \
+    use_indexer=false indexer_loss_scaling_factor=0.0 \
+    base_output_directory=${BASE_OUTPUT_DIRECTORY?} ...
+```
+* **LM Loss**: Active (`xent_sum > 0`).
+* **Indexer Loss**: Inactive (`0.0`).
+
+#### 2. Stage 2: Lightning Indexer Warm-up (CSA Indexer Distillation)
+A short warm-up stage when introducing attention sparsity. The indexer learns to predict important compressed KV blocks by matching the teacher's attention distribution via KL divergence distillation (DeepSeek-V3.2 §2.1, Eqs. 3–4). The main model parameters are frozen and its cross-entropy loss is skipped for efficiency (`xent_sum = 0.0`).
+```sh
+python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/base.yml \
+    src/maxtext/configs/models/deepseek4-284b.yml \
+    run_name=stage2_indexer_warmup \
+    use_indexer=true indexer_sparse_training=false indexer_loss_scaling_factor=1.0 \
+    trainable_parameters_mask="['.*indexer.*']" \
+    base_output_directory=${BASE_OUTPUT_DIRECTORY?} ...
+```
+* **LM Loss**: Skipped (`xent_sum = 0.0`).
+* **Indexer Loss**: Active (`indexer_loss > 0.0`).
+* **Attention**: Teacher computes dense attention across all compressed blocks.
+
+#### 3. Stage 3: Sparse Pre-training (64K+ context, steady state)
+Core attention attends only to the top-k selected compressed blocks. Both the main model LM loss and the auxiliary indexer distillation loss are actively trained.
+```sh
+python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/base.yml \
+    src/maxtext/configs/models/deepseek4-284b.yml \
+    run_name=stage3_sparse_pretraining \
+    use_indexer=true indexer_sparse_training=true indexer_loss_scaling_factor=1.0 \
+    base_output_directory=${BASE_OUTPUT_DIRECTORY?} ...
+```
+* **LM Loss**: Active (`xent_sum > 0`).
+* **Indexer Loss**: Active (`indexer_loss > 0.0`).
+* **Attention**: Sparse core attention over top-k selected blocks.
+
 ## Fine-tuning
 
 After you have a MaxText compatible checkpoint, you could fine-tune it with different datasets.
