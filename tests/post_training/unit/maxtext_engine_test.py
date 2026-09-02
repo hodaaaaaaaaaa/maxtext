@@ -61,10 +61,13 @@ class DummyStatefulNNXModel(nnx.Module):
     self.calls = nnx.BatchStat(jnp.array(0.0))
 
 
-@dataclasses.dataclass(kw_only=True)
+# `payload_dataclass` resolves to a dataclass decorator at import time, but pylint only
+# recognises the literal `dataclasses.dataclass`/`flax.struct.dataclass` forms and so reports the
+# `field()` calls below as being outside a dataclass.
+@abstract_engine.payload_dataclass
 class DummyPayload(abstract_engine.TrainerPayload):
-  token_ids: Any = dataclasses.field(default_factory=lambda: jnp.ones((2, 2)))
-  token_mask: Any = dataclasses.field(default_factory=lambda: jnp.ones((2, 2)))
+  token_ids: Any = dataclasses.field(default_factory=lambda: jnp.ones((2, 2)))  # pylint: disable=invalid-field-call
+  token_mask: Any = dataclasses.field(default_factory=lambda: jnp.ones((2, 2)))  # pylint: disable=invalid-field-call
 
 
 class MaxTextTrainingEngineTest(absltest.TestCase):

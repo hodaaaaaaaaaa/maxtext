@@ -295,7 +295,7 @@ def _conform_accumulator(value: Any, target: jax.sharding.NamedSharding) -> Any:
   return jax.device_put(value, target)
 
 
-@dataclasses.dataclass(kw_only=True)
+@abstract_engine.payload_dataclass
 class RouterReplayTrainerPayload(abstract_engine.TrainerPayload):
   """A TrainerPayload extension carrying forced router-replay expert decisions.
 

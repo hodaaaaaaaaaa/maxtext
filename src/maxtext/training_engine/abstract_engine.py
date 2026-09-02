@@ -71,7 +71,29 @@ __all__ = [
     "TrainerPayload",
     "TrainingConfig",
     "WeightedMetric",
+    "payload_dataclass",
 ]
+
+
+# Decorate every `TrainerPayload` subclass with this rather than with `dataclasses.dataclass`.
+#
+# Tunix turned `TrainerPayload` into a frozen `flax.struct.dataclass`; at the revision
+# `src/dependencies/extra_deps/post_train_github_deps.txt` pins, it is still a plain mutable
+# dataclass. Python rejects *both* directions of frozen/non-frozen dataclass inheritance
+# ("cannot inherit non-frozen dataclass from a frozen one", and the converse), so a subclass has
+# to follow whichever tunix is installed rather than pick a side; hard-coding either one turns a
+# dependency bump into a TypeError at module load.
+#
+# `flax.struct.dataclass` on the frozen path, not a bare `frozen=True`: only the former registers
+# the subclass as a pytree node. A plain frozen subclass of a registered parent is absent from the
+# registry, so `jax.tree.leaves(payload)` yields the payload itself as one leaf instead of its
+# fields -- which type-checks, runs, and is wrong for any caller putting a payload across a
+# `jax.jit` or `jax.device_put` boundary.
+payload_dataclass = (
+    flax.struct.dataclass(frozen=True, kw_only=True)
+    if TrainerPayload.__dataclass_params__.frozen
+    else dataclasses.dataclass(kw_only=True)
+)
 
 
 @flax.struct.dataclass
