@@ -54,6 +54,8 @@ import numpy as np
 # same situation. Real buffers are identified by their train step, so this cannot collide.
 EMPTY_METRICS_BUFFER_ID = -1
 
+_RAIDEN_WORKER_INDEX_STRIDE = 10_000  # >> any plausible piece count (dozens-to-low-hundreds of groups)
+
 
 def _malloc_trim() -> None:
   try:
@@ -398,6 +400,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     self._raiden_syncs: Any = None
     self._last_staged_step: Optional[int] = None
     self._staged_metadata: Any = None
+    self._warned_raiden_sync_chunks: bool = False
     vllm_cfg = getattr(self._config, "vllm", {})
     if isinstance(vllm_cfg, dict):
       vllm_use_wc = vllm_cfg.get("use_weight_converter", False)
@@ -1203,37 +1206,8 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       return nnx.state(model, nnx.Param)
     return self.model
 
-  def _split_into_chunks(self, nested_state: Any, num_chunks: int) -> list[Any]:
-    """Splits a nested param dict into `num_chunks` nested dicts of near-equal leaf count.
-
-    Rebinding raiden's native WeightSynchronizer with a full new array list
-    only releases its hold on the PREVIOUS bind's buffers atomically with
-    acquiring the new ones (BindWeights: "releases the holds on the
-    previously bound buffers and acquires holds on the new ones") -- so the
-    complete new state must already be host-staged before the old one can be
-    dropped, and every rebind after the first needs ~2x one copy's worth of
-    host memory, not ~1x. Splitting the state across `num_chunks` independent
-    RaidenSynchronizer instances -- each bound, D2H'd, and released one at a
-    time -- bounds that overlap to ~(num_chunks+1)/num_chunks of one copy
-    instead of ~2x. Confirmed against a live OOM at num_chunks=1: main hit
-    the 420G container limit on a Qwen3-30B-A3B (~245GB bf16) trainer's
-    SECOND weight-sync cycle (the first has no stale buffer to overlap with).
-    The orchestrator and rollout's RaidenSamplerAdapter already support a
-    source contributing multiple WorkUnitMetadata entries (pooled by exact
-    variable name in manifest preflight, not by unit count), so no changes
-    are needed outside this trainer-side split.
-    """
-    if hasattr(nested_state, "to_pure_dict"):
-      pure_state = nested_state.to_pure_dict()
-    elif hasattr(nested_state, "to_dict"):
-      pure_state = nested_state.to_dict()
-    else:
-      pure_state = nested_state
-    flat = flatten_dict(pure_state)
-    chunk_flats = [{} for _ in range(num_chunks)]
-    for i, key in enumerate(flat):
-      chunk_flats[i % num_chunks][key] = flat[key]
-    return [unflatten_dict(cf) for cf in chunk_flats]
+  def _raiden_worker_index(self, piece_idx: int) -> int:
+    return jax.process_index() * _RAIDEN_WORKER_INDEX_STRIDE + piece_idx + 1
 
   def prepare_weight_sync(
       self,
@@ -1288,6 +1262,13 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
 
       # 2. Extract clean trainable parameters
       params_state = self._get_trainable_params_state()
+      piece_batch = max(1, int(os.environ.get("RAIDEN_STREAM_PIECE_BATCH", "1")))
+      if "RAIDEN_WEIGHT_SYNC_CHUNKS" in os.environ and not getattr(self, "_warned_raiden_sync_chunks", False):
+        logging.warning(
+            "RAIDEN_WEIGHT_SYNC_CHUNKS is deprecated and no longer affects Raiden staging; "
+            "use RAIDEN_STREAM_PIECE_BATCH instead."
+        )
+        self._warned_raiden_sync_chunks = True
 
       if self._use_weight_converter:
         if self._weight_converter is None:
@@ -1297,92 +1278,94 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
               rollout_backend=self._rollout_backend,
               debug=getattr(self._config, "weight_sync_debug", False),
           )
-        params_state = self._weight_converter.convert(params_state)
-        gc.collect()
+        piece_iter = self._weight_converter.convert_streaming(params_state, groups_per_piece=piece_batch)
       else:
-        # 2a. The trainer keeps float32 master weights, but the rollout side
-        # (MaxTextForCausalLM under configs/inference/vllm.yml) loads/serves in
-        # bfloat16 -- Raiden's manifest preflight rejects a dtype/item_size
-        # mismatch, and binding mismatched-dtype buffers would be wrong anyway.
-        # Cast the synced copy down; the trainer's own params_state (used for
-        # the actual optimizer step) is untouched since this is a fresh tree.
+        # UNCHANGED, deliberately out of scope: this fp32->bf16 cast is an
+        # on-device (HBM, not host RAM) full materialization -- a different
+        # memory pool than the host OOM this plan addresses. Candidate
+        # fast-follow: fold into unscan_layers_streaming's per-piece slicing.
         params_state = jax.tree_util.tree_map(
             lambda x: x.astype(jnp.bfloat16) if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating) else x,
             params_state,
         )
-
-        # 2b. The trainer runs scanned (scan_layers=True) for training speed, but
-        # the rollout side loads its MaxText model unscanned (MaxTextForCausalLM
-        # under configs/inference/vllm.yml has scan_layers=False). Raiden matches
-        # tensors by name, so unscan here -- on the trainer side only -- so the
-        # names/shapes we bind already match what the sampler reports.
         if self._config.scan_layers:
-          params_state = raiden_unscan.unscan_layers(
+          piece_iter = raiden_unscan.unscan_layers_streaming(
               params_state,
               num_layers=self._config.num_decoder_layers,
               scan_axis=self._config.param_scan_axis,
+              keys_per_piece=piece_batch,
           )
+        else:
+          piece_iter = iter([params_state])
 
-      # 3. Bind parameters to the Raiden transport, one chunk at a time (see
-      # _split_into_chunks) -- construct the per-chunk synchronizers once,
-      # matching the persistent-instance-per-cycle pattern the rebind
-      # optimization (fewer stale holds) depends on.
-      num_chunks = max(1, int(os.environ.get("RAIDEN_WEIGHT_SYNC_CHUNKS", "1")))
-      if self._raiden_syncs is None:
-        # Under Pathways (JAX_PLATFORMS=proxy + JAX_BACKEND_TARGET set, same
-        # detection tunix's K8sJaxContext.initialize() uses), trainer params
-        # are proxy-backed and Raiden can't bind them in place -- host_stage
-        # pulls them to client host memory first. Direct-TPU trainers skip
-        # that extra copy since their params already live on TPU.
-        is_pathways = bool("proxy" in os.environ.get("JAX_PLATFORMS", "") and os.environ.get("JAX_BACKEND_TARGET"))
-        # worker_index must be unique per chunk (it seeds WorkUnitId's
-        # job_replica_id) -- otherwise every chunk's work unit collides under
-        # the same id in the handler's registry and only one survives
-        # registration.
-        self._raiden_syncs = [
-            raiden_synchronizer.RaidenSynchronizer(
-                job_name="trainer",
-                worker_index=jax.process_index() if num_chunks == 1 else (jax.process_index() * num_chunks + i + 1),
-                auto_h2d=False,
-                host_stage=is_pathways,
-                parallelism=4,
-            )
-            for i in range(num_chunks)
-        ]
-
-      chunks = self._split_into_chunks(params_state, num_chunks) if num_chunks > 1 else [params_state]
       del params_state
       gc.collect()
 
+      if self._raiden_syncs is None:
+        self._raiden_syncs = []
+
+      expected_num_pieces = len(self._raiden_syncs) if self._raiden_syncs else None
+      is_pathways = bool("proxy" in os.environ.get("JAX_PLATFORMS", "") and os.environ.get("JAX_BACKEND_TARGET"))
       verify_weights = os.environ.get("VERIFY_WEIGHTS", "").lower() == "true"
       all_metadata = []
       total_variables = 0
-      for chunk_idx, (sync, chunk_state) in enumerate(zip(self._raiden_syncs, chunks)):
-        sync.bind(chunk_state)
-        del chunk_state
+      piece_idx = -1
+
+      for piece_idx, piece in enumerate(piece_iter):
+        if expected_num_pieces is None and piece_idx >= len(self._raiden_syncs):
+          self._raiden_syncs.append(
+              raiden_synchronizer.RaidenSynchronizer(
+                  job_name="trainer",
+                  worker_index=self._raiden_worker_index(piece_idx),
+                  auto_h2d=False,
+                  host_stage=is_pathways,
+                  parallelism=4,
+              )
+          )
+        elif piece_idx >= len(self._raiden_syncs):
+          del piece
+          break
+
+        sync = self._raiden_syncs[piece_idx]
+        sync.bind(piece)
+        del piece
         gc.collect()
 
-        # 4. Initiate Device-to-Host transfer to stage this chunk for network
-        # transfer before moving on to the next chunk.
+        # 4. Initiate Device-to-Host transfer to stage this piece for network
+        # transfer before moving on to the next piece.
         if sync.active:
           sync.d2h()
 
         if verify_weights:
-          logging.info("Source weights checksums (chunk %d): %s", chunk_idx, sync.checksums())
+          logging.info("Source weights checksums (piece %d): %s", piece_idx, sync.checksums())
 
         metadata = sync.work_unit_metadata()
         total_variables += len(metadata.variables)
         all_metadata.append(metadata)
         sync.release_host_arrays()
 
+      if expected_num_pieces is not None:
+        remaining = 0
+        for _ in piece_iter:
+          remaining += 1
+        num_pieces = (piece_idx + 1) + remaining
+        if num_pieces != expected_num_pieces:
+          raise RuntimeError(
+              f"weight-sync piece count changed from {expected_num_pieces} to {num_pieces} "
+              "between rounds; the cached conversion plan should make this impossible "
+              "unless the model/config changed mid-run."
+          )
+      else:
+        num_pieces = piece_idx + 1
+
       gc.collect()
       _malloc_trim()
 
       logging.info(
-          "Trainer prepared weight sync for step %d: registered %d variables across %d chunk(s) on mesh %s",
+          "Trainer prepared weight sync for step %d: registered %d variables across %d piece(s) on mesh %s",
           self.train_step,
           total_variables,
-          num_chunks,
+          num_pieces,
           all_metadata[0].mesh_axes if all_metadata else None,
       )
       self._last_staged_step = self.train_step
