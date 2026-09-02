@@ -77,13 +77,17 @@ def _is_jax_dynamic(value: Any) -> bool:
   them are arrays. Tunix's GRPO adapter, for instance, returns a `TrainExample` alongside
   an `algo_config` object and integer `pad_id`/`eos_id`. The arrays must be traced; the
   rest must be closed over, or `jax.jit` rejects the call outright.
+
+  `jax.ShapeDtypeStruct` counts, because ahead-of-time compilation (`lower`) drives the
+  whole path on shapes alone. Omitting it would classify the AOT batch static and lower
+  the kernel with no batch argument at all.
   """
   leaves = jax.tree.leaves(value)
   if not leaves:
     # An all-`None` subtree (e.g. an unset `ref_per_token_logps`) flattens to nothing. It
     # carries no data either way, so tracing it is harmless and keeps the treedef intact.
     return True
-  return any(isinstance(leaf, (jax.Array, np.ndarray, np.generic)) for leaf in leaves)
+  return any(isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct, np.ndarray, np.generic)) for leaf in leaves)
 
 
 def _split_static_and_dynamic(batch: Any) -> tuple[Any, dict[str, Any]]:
@@ -295,6 +299,55 @@ def _conform_accumulator(value: Any, target: jax.sharding.NamedSharding) -> Any:
   return jax.device_put(value, target)
 
 
+def _to_aval(value: Any) -> Any:
+  """Returns `value` as a `jax.ShapeDtypeStruct`, keeping whatever sharding it carries.
+
+  `jax.jit(...).lower()` accepts arrays and avals interchangeably, so `lower` converts
+  everything first and the two paths cannot diverge on the array-vs-aval distinction.
+  Anything without a shape -- a None, a Python scalar sitting in an optimizer state -- is
+  passed through, which is what the live path hands the same kernel.
+  """
+  if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+    return value
+  return jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=getattr(value, "sharding", None))
+
+
+def _explicit_mesh_view(mesh: jax.sharding.Mesh) -> jax.sharding.Mesh:
+  """Returns `mesh` with every axis marked `Explicit`, for sharding propagation only.
+
+  `jax.eval_shape` carries a value's layout through an operation only on explicit axes;
+  under `Auto` the answer comes back `None` and every optimizer moment would look
+  replicated. The view is only ever used to *observe* the layouts -- they are re-homed onto
+  the real mesh, whose axis types decide what actually happens.
+  """
+  axis_types = getattr(mesh, "axis_types", None)
+  if axis_types is not None and all(axis_type == jax.sharding.AxisType.Explicit for axis_type in axis_types):
+    return mesh
+  return jax.sharding.Mesh(
+      mesh.devices,
+      mesh.axis_names,
+      axis_types=(jax.sharding.AxisType.Explicit,) * len(mesh.axis_names),
+  )
+
+
+def _rehome_aval(aval: Any, mesh: jax.sharding.Mesh) -> Any:
+  """Returns `aval` with its sharding spec re-expressed on `mesh`.
+
+  Propagation hands back `NamedSharding`s on whichever mesh was active during the trace --
+  an `AbstractMesh`, or the explicit view above. `_mesh_sharding` compares meshes by
+  equality, so a spec that is right but homed elsewhere would be silently replaced by a
+  replicated one.
+
+  A leaf with no shape has nothing to re-home and is returned as it came, the same guard
+  `_to_aval` and `_place_state_on_mesh` make.
+  """
+  if not hasattr(aval, "shape") or not hasattr(aval, "dtype"):
+    return aval
+  spec = getattr(getattr(aval, "sharding", None), "spec", None)
+  target = jax.sharding.NamedSharding(mesh, spec) if spec is not None else None
+  return jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=target)
+
+
 @abstract_engine.payload_dataclass
 class RouterReplayTrainerPayload(abstract_engine.TrainerPayload):
   """A TrainerPayload extension carrying forced router-replay expert decisions.
@@ -430,6 +483,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       mesh: jax.sharding.Mesh | None = None,
       wrap_with_tunix_adapter: bool = False,
       tokenizer_pad_id: int | None = None,
+      materialize_weights: bool = True,
   ) -> None:
     """Initializes the MaxText trainer state and sharded model.
 
@@ -443,11 +497,18 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
         `wrap_with_tunix_adapter` is True: without it the adapter passes `decoder_segment_ids=None`, MaxText
         falls back to causal-only masking, and pad positions are attended to -- silently corrupting trainer
         log-probs on every batch.
+      materialize_weights: If False, the weights and optimizer state are built as
+        `jax.ShapeDtypeStruct`s carrying the shardings the real ones would have, and no
+        device memory is allocated. Enough to trace and lower every kernel, which is what
+        `lower()` does, but nothing can be executed: `fwd_bwd`, `update` and the checkpoint
+        methods raise. Used for ahead-of-time compilation against a topology the host does
+        not own -- see `training_engine/maxtext_engine_compile.py`.
 
     Raises:
       TypeError: If training_config is not a pyconfig.HyperParameters instance.
       ValueError: If training_config.model_name is not specified or empty, or if `wrap_with_tunix_adapter`
-        is requested without `tokenizer_pad_id` or without a `mesh`.
+        is requested without `tokenizer_pad_id` or without a `mesh`, or if `materialize_weights`
+        is False without a `mesh`.
       NotImplementedError: If `training_config.lora.enable_lora` is True. This engine has no LoRA
         path and would otherwise full-finetune the base model while the config claims LoRA.
     """
@@ -463,6 +524,18 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
         )
       if mesh is None:
         raise ValueError("wrap_with_tunix_adapter=True requires a mesh; the adapter is built under it.")
+    if not materialize_weights:
+      if mesh is None:
+        raise ValueError(
+            "materialize_weights=False requires a mesh. Without weights there is nothing to read a device "
+            "set off, and the whole point of the abstract path is to compile against a mesh the host does "
+            "not own -- build one with `maxtext_engine_compile.get_topology_mesh`."
+        )
+      if wrap_with_tunix_adapter:
+        raise NotImplementedError(
+            "materialize_weights=False does not support wrap_with_tunix_adapter: the adapter is applied by "
+            "`from_pretrained`, which the abstract path deliberately skips."
+        )
 
     # This engine has no LoRA path
     if getattr(getattr(training_config, "lora", None), "enable_lora", False):
@@ -490,23 +563,27 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     self._compiled_signature: Any = None
     self._signature_compare_warned: bool = False
     self._raiden_syncs: Any = None
+    self._materialized = materialize_weights
     if not training_config.model_name:
       raise ValueError("training_config.model_name must be specified")
-    model_or_model_mesh_pair = model_creation_utils.from_pretrained(
-        config=self._config,
-        mesh=self._mesh,
-        model_mode=common_types.MODEL_MODE_TRAIN,
-        rng_key=self._init_rng,
-        wrap_with_tunix_adapter=wrap_with_tunix_adapter,
-        tokenizer_pad_id=tokenizer_pad_id,
-    )
-    # `from_pretrained` returns `(model, mesh)` when it had to derive the mesh itself, and just the model
-    # when one was supplied. Adopt the derived mesh so `self._model` is always a module and `compile()` can
-    # still build shardings.
-    if self._mesh is None:
-      self._model, self._mesh = model_or_model_mesh_pair
+    if materialize_weights:
+      model_or_model_mesh_pair = model_creation_utils.from_pretrained(
+          config=self._config,
+          mesh=self._mesh,
+          model_mode=common_types.MODEL_MODE_TRAIN,
+          rng_key=self._init_rng,
+          wrap_with_tunix_adapter=wrap_with_tunix_adapter,
+          tokenizer_pad_id=tokenizer_pad_id,
+      )
+      # `from_pretrained` returns `(model, mesh)` when it had to derive the mesh itself, and just the model
+      # when one was supplied. Adopt the derived mesh so `self._model` is always a module and `compile()` can
+      # still build shardings.
+      if self._mesh is None:
+        self._model, self._mesh = model_or_model_mesh_pair
+      else:
+        self._model = model_or_model_mesh_pair
     else:
-      self._model = model_or_model_mesh_pair
+      self._model = self._create_abstract_model()
     self._state: Any = None
     # Pure-pytree mirror of the model and train state, carried across steps so the step path
     # never re-walks the module graph. `None` means "not cached".
@@ -541,16 +618,85 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     # `checkpointing.CheckpointState` expects an nnx.Optimizer too, so wrap it here. `wrt=nnx.Param`
     # covers every parameter, which is correct only because LoRA is rejected above.
     self._learning_rate_schedule, tx = train_utils.create_training_optimizer(self._config, self._model)
-    self._optimizer = nnx.Optimizer(self._model, tx, wrt=nnx.Param)
+    if materialize_weights:
+      self._optimizer = nnx.Optimizer(self._model, tx, wrt=nnx.Param)
+    else:
+      # `nnx.Optimizer` allocates the moments eagerly with `zeros_like`, so the abstract
+      # path builds the whole train state under a shape-only trace instead, then rebinds
+      # the model to the one inside it so `self.model` and `self.state` stay one graph.
+      self._state = self._create_abstract_state(tx)
+      self._model = getattr(self._state, _MODEL_STATE_KEY)
+      self._optimizer = getattr(self._state, _OPTIMIZER_STATE_KEY)
     self._train_step: int = 0
 
     self._checkpoint_manager = checkpointing.CheckpointManager(
-        checkpoint_dir=self._config.checkpoint_dir,
+        # No directory on the abstract path: an engine that can never save should not have
+        # Orbax create one.
+        checkpoint_dir=self._config.checkpoint_dir if materialize_weights else "",
         config=self._config,
     )
     self._metrics_recorder = metrics_module.MetricsRecorder()
     self._throttler = inflight_throttler.InflightThrottler(config=self._config)
     self._raiden_syncs: Any = None
+
+  def _create_abstract_model(self) -> Any:
+    """Returns the model with `jax.ShapeDtypeStruct` weights on their real shardings.
+
+    The same `create_nnx_abstract_model` call `from_pretrained` makes before it
+    materializes anything, which is why the two parameter layouts agree rather than merely
+    resemble each other: `from_pretrained` derives the live model's shardings from this
+    very tree. Checkpoint loading and conversion are skipped, so an ahead-of-time compile
+    needs no weights, no HF token and no network.
+    """
+    config = model_creation_utils.verify_and_sync_scan_layers(self._config)
+    _, abstract_model = model_creation_utils.create_nnx_abstract_model(
+        config,
+        self._mesh,
+        model_mode=common_types.MODEL_MODE_TRAIN,
+        rng_key=self._init_rng,
+    )
+    return abstract_model
+
+  def _create_abstract_state(self, tx: Any) -> Any:
+    """Returns the `TrainStateNNX` for an abstract model, moments included, as avals.
+
+    Two traces of the same construction, because neither alone answers both questions:
+
+    - `nnx.eval_shape` gives the module graph -- variable types, paths, the `TrainStateNNX`
+      wrapper -- but drops shardings, since it evaluates on plain avals.
+    - `jax.eval_shape` over an all-`Explicit` view of the mesh gives the layouts, because
+      that is where JAX carries a parameter's sharding through the `zeros_like` inside
+      `tx.init` into the moment allocated from it -- which is what the eager
+      `nnx.Optimizer` gets for free from real arrays, and why the moments come out on the
+      parameters' layout rather than replicated.
+
+    The result is merged back onto the real mesh, whose axis types -- not the view's --
+    decide what the compiled kernels do.
+    """
+    model_graphdef, model_pure = nnx.split(self._model)
+
+    def build(model_state):
+      model = nnx.merge(model_graphdef, model_state)
+      return train_state_nnx.TrainStateNNX(model, nnx.Optimizer(model, tx, wrt=nnx.Param))
+
+    explicit_mesh = _explicit_mesh_view(self._mesh)
+    with nn_partitioning.axis_rules(self._config.logical_axis_rules):
+      state_graphdef, _ = nnx.split(nnx.eval_shape(build, model_pure))
+      with jax.set_mesh(explicit_mesh):
+        state_pure = jax.eval_shape(
+            lambda model_state: nnx.split(build(model_state))[1],
+            jax.tree.map(lambda aval: _rehome_aval(aval, explicit_mesh), model_pure),
+        )
+    return nnx.merge(state_graphdef, jax.tree.map(lambda aval: _rehome_aval(aval, self._mesh), state_pure))
+
+  def _require_materialized(self, operation: str) -> None:
+    """Raises if `operation` needs weights and this engine was built without them."""
+    if not self._materialized:
+      raise RuntimeError(
+          f"MaxTextTrainingEngine.{operation}() needs real weights, but this engine was built with "
+          "materialize_weights=False. Such an engine exists only to be traced and lowered: call "
+          "`lower()` instead, or construct the engine without materialize_weights=False."
+      )
 
   @property
   def model(self) -> Any:
@@ -820,6 +966,49 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
 
     return jax.tree.map(target, params_pure, params_shardings)
 
+  def _place_state_on_mesh(self) -> None:
+    """Commits every train-state leaf to this mesh, in place, before anything is compiled.
+
+    `nnx.Optimizer` builds its bookkeeping scalars -- optax's `count`, its own `step` --
+    with `jnp.zeros` under no mesh at all, so they arrive uncommitted on device 0 while
+    every parameter spans the mesh. The mismatch is invisible for exactly one step: the
+    first `_update_kernel` returns them committed, so the second update is dispatched with
+    a different argument signature and the largest kernel in the engine compiles a second
+    time, for a program that ran once. Committing them up front costs three scalar
+    `device_put`s and makes steps one and two the same program.
+
+    It is also what lets `lower()` describe the steady state rather than the first step,
+    and so what makes an ahead-of-time memory report true of the whole run.
+    """
+    if self._mesh is None or self._state is None:
+      return
+    moved = False
+
+    def place(leaf):
+      nonlocal moved
+      # `device_put` would turn a Python scalar sitting in the state into a device array
+      # behind everyone's back.
+      if not hasattr(leaf, "shape") or not hasattr(leaf, "dtype"):
+        return leaf
+      leaf_sharding = getattr(leaf, "sharding", None)
+      if isinstance(leaf_sharding, jax.sharding.NamedSharding) and leaf_sharding.mesh == self._mesh:
+        return leaf
+      moved = True
+      target = self._mesh_sharding(leaf)
+      # An abstract engine has nothing to move; restating the aval is how it arrives at the
+      # same signature the live engine settles on.
+      if isinstance(leaf, jax.ShapeDtypeStruct):
+        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=target)
+      return jax.device_put(leaf, target)
+
+    placed = jax.tree.map(place, self._read_state_pure())
+    if not moved:
+      return
+    with self._sharding_ctx():
+      nnx.update(self._state, placed)
+    self._invalidate_pure_state()
+    self._refresh_pure_state()
+
   def _shard_optimizer_state_over_data(self) -> None:
     """Moves the optimizer's parameter-shaped state onto the Zero-1 layout, in place.
 
@@ -850,6 +1039,10 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       if target is None:
         return leaf
       moved = True
+      # An abstract engine has nothing to move; restating the aval on the Zero-1 layout is
+      # what the shardings below are then read back off.
+      if isinstance(leaf, jax.ShapeDtypeStruct):
+        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=target)
       return jax.device_put(leaf, target)
 
     optimizer_pure = jax.tree.map(place, state_pure[_OPTIMIZER_STATE_KEY])
@@ -1159,6 +1352,9 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     # The only place the graphs are walked: a recompile is when they may legitimately have
     # changed shape, and everything after is maintained as plain pytrees.
     self._refresh_pure_state()
+    # First, so the Zero-1 pass below and the shardings read off the state afterwards both
+    # see a state that is entirely on this mesh rather than mostly on it.
+    self._place_state_on_mesh()
     # Before the shardings below are read off the state: this is what puts the optimizer
     # moments on the Zero-1 layout, and `state_mesh_shardings` has to see them there.
     self._shard_optimizer_state_over_data()
@@ -1289,6 +1485,67 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     dynamic_batch, static_batch = _split_static_and_dynamic(self._prepare_batch(dummy_data))
     self._compile_for_batch(dynamic_batch, static_batch)
 
+  def lower(self, dummy_data: abstract_engine.TrainerPayload) -> dict[str, jax.stages.Lowered]:
+    """Lowers every kernel this engine runs, without executing any of them.
+
+    The ahead-of-time entry point. `dummy_data` is a payload of the shape the engine will
+    be driven with -- `jax.ShapeDtypeStruct`s are enough, and are what
+    `training_engine/maxtext_engine_compile.py` passes -- and the three returned `Lowered`s cover
+    the whole step: the first micro-batch's forward/backward, the accumulating one that
+    every later micro-batch of the same update runs, and the optimizer update.
+
+    Both the shapes and the *shardings* they are lowered against come from
+    `_compile_for_batch`, the same method the live path calls on its first `fwd_bwd`, so
+    this is not a reconstruction of what training does but the identical call, minus the
+    data. `tests/post_training/unit/maxtext_engine_xaot_test.py` pins the resulting HLO
+    against a live engine's, byte for byte.
+
+    The accumulating kernel is lowered even for a single-micro-batch run, where the live
+    engine never traces it: omitting the kernel with the extra parameter-sized accumulator
+    live in it would understate exactly the number that decides whether a configuration
+    fits.
+
+    Args:
+      dummy_data: One micro-batch, real or abstract, standing in for the batches the
+        engine will be given. Its structure must match them, exactly as `compile()`'s does.
+
+    Returns:
+      `{"fwd_bwd": ..., "fwd_bwd_accum": ..., "update": ...}`.
+
+    Raises:
+      ValueError: If `dummy_data` is None; there is nothing to lower against.
+    """
+    if dummy_data is None:
+      raise ValueError(
+          "lower() needs a dummy payload to lower against -- unlike compile(), it cannot defer to the "
+          "first real batch, because an engine being lowered is never given one."
+      )
+    dynamic_batch, static_batch = _split_static_and_dynamic(self._prepare_batch(dummy_data))
+    self._compile_for_batch(dynamic_batch, static_batch)
+
+    state_aval = jax.tree.map(_to_aval, self._read_state_pure())
+    params_pure, rest_pure = self._read_model_pure(getattr(self._state, _MODEL_STATE_KEY, self._model))
+    params_aval = jax.tree.map(_to_aval, params_pure)
+    rest_aval = jax.tree.map(_to_aval, rest_pure)
+    batch_aval = jax.tree.map(_to_aval, dynamic_batch)
+    # `skip_step_on_spikes` is the only thing that gives `_update_kernel` a fourth
+    # argument; without it `update()` passes None and so must this.
+    mean_loss_aval = jax.ShapeDtypeStruct((), jnp.float32) if self._config.skip_step_on_spikes else None
+
+    with self._sharding_ctx():
+      fwd_bwd = self._compiled_fwd_bwd.lower(params_aval, rest_aval, batch_aval)
+      # Read off the forward/backward kernel's own outputs rather than predicted from the
+      # parameters: the gradients differ from them by `grad_dtype` and, under deferral, an
+      # `unreduced` tag, and the denominator's shape is the loss function's business.
+      _, _, _, grads_aval, denominator_aval = fwd_bwd.out_info
+      return {
+          "fwd_bwd": fwd_bwd,
+          "fwd_bwd_accum": self._compiled_fwd_bwd_accum.lower(
+              params_aval, rest_aval, batch_aval, grads_aval, denominator_aval
+          ),
+          "update": self._compiled_update.lower(state_aval, grads_aval, denominator_aval, mean_loss_aval),
+      }
+
   def fwd_bwd(self, payload: abstract_engine.TrainerPayload, **kwargs: Any) -> None:
     """Executes a micro-batch forward-backward pass and accumulates gradients.
 
@@ -1297,6 +1554,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       **kwargs: Implementation-specific options, accepted for interface compatibility
         and ignored by this engine.
     """
+    self._require_materialized("fwd_bwd")
     batch = self._prepare_batch(payload)
 
     model = getattr(self._state, "model", None) if self._state is not None else self._model
@@ -1369,6 +1627,10 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     Returns:
       The train step count after this update. Unchanged when there is nothing to apply.
     """
+    # Ahead of the early return below, which an abstract engine would otherwise take -- it
+    # has no accumulated gradients and never will -- and report a step count for an update
+    # that cannot happen.
+    self._require_materialized("update")
     if self._accumulated_grads is None:
       return self.train_step
 
@@ -1483,6 +1745,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       metadata: Checkpoint metadata payload from Orchestrator.
       **kwargs: Additional checkpoint saving options.
     """
+    self._require_materialized("save_checkpoint")
     # Drain all inflight computations and log pending metrics before checkpointing.
     self._throttler.wait_for_all()
 
@@ -1540,6 +1803,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     Returns:
       The metadata PyTree of the restored checkpoint.
     """
+    self._require_materialized("restore_checkpoint")
     step = kwargs.get("step", None)
     checkpoint_state = checkpointing.CheckpointState(
         model=self.model,
