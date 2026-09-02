@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 import dataclasses
+import gc
 import os
 from typing import Any
 
@@ -52,6 +53,14 @@ import numpy as np
 # Mirrors Tunix's `PeftTrainer.get_metrics`, which returns `MetricsBuffer(id=-1)` in the
 # same situation. Real buffers are identified by their train step, so this cannot collide.
 EMPTY_METRICS_BUFFER_ID = -1
+
+
+def _malloc_trim() -> None:
+  try:
+    import ctypes  # pylint: disable=g-import-not-at-top
+    ctypes.CDLL("libc.so.6").malloc_trim(0)
+  except Exception:
+    pass
 
 
 def _is_jax_dynamic(value: Any) -> bool:
@@ -384,9 +393,26 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
         checkpoint_dir=self._config.checkpoint_dir,
         config=self._config,
     )
-    self._metrics_recorder = metrics_module.MetricsRecorder()
     self._throttler = inflight_throttler.InflightThrottler(config=self._config)
     self._raiden_syncs: Any = None
+    self._last_staged_step: Optional[int] = None
+    self._staged_metadata: Any = None
+    self._use_weight_converter = bool(
+        getattr(self._config, "use_weight_converter", False)
+        or os.environ.get("USE_WEIGHT_CONVERTER", "0").lower() in ("1", "true", "yes")
+    )
+    self._rollout_backend = (
+        getattr(self._config, "rollout_backend", "maxtext") or os.environ.get("ROLLOUT_BACKEND", "maxtext")
+    )
+    if self._use_weight_converter:
+      from maxtext.integration.vllm.weight_converter import WeightConverter  # pylint: disable=g-import-not-at-top,import-outside-toplevel
+      self._weight_converter = WeightConverter(
+          config=self._config,
+          rollout_backend=self._rollout_backend,
+          debug=getattr(self._config, "weight_sync_debug", False),
+      )
+    else:
+      self._weight_converter = None
 
   @property
   def model(self) -> Any:
@@ -1226,34 +1252,64 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
             " tunix build that ships it, or select a different staging_transport."
         ) from exc
 
+      if (
+          self._raiden_syncs is not None
+          and self._last_staged_step == self.train_step
+          and self._staged_metadata is not None
+      ):
+        logging.info(
+            "Trainer re-using staged weight sync for step %d (%d variables)",
+            self.train_step,
+            sum(len(m.variables) for m in self._staged_metadata),
+        )
+        return self._staged_metadata
+
+      if self._raiden_syncs is not None:
+        for sync in self._raiden_syncs:
+          sync.release_host_arrays()
+        gc.collect()
+        _malloc_trim()
+
       # 1. Drain all in-flight TPU computations to ensure weights are fully updated
       self._throttler.wait_for_all()
+      gc.collect()
 
       # 2. Extract clean trainable parameters
       params_state = self._get_trainable_params_state()
 
-      # 2a. The trainer keeps float32 master weights, but the rollout side
-      # (MaxTextForCausalLM under configs/inference/vllm.yml) loads/serves in
-      # bfloat16 -- Raiden's manifest preflight rejects a dtype/item_size
-      # mismatch, and binding mismatched-dtype buffers would be wrong anyway.
-      # Cast the synced copy down; the trainer's own params_state (used for
-      # the actual optimizer step) is untouched since this is a fresh tree.
-      params_state = jax.tree_util.tree_map(
-          lambda x: x.astype(jnp.bfloat16) if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating) else x,
-          params_state,
-      )
-
-      # 2b. The trainer runs scanned (scan_layers=True) for training speed, but
-      # the rollout side loads its MaxText model unscanned (MaxTextForCausalLM
-      # under configs/inference/vllm.yml has scan_layers=False). Raiden matches
-      # tensors by name, so unscan here -- on the trainer side only -- so the
-      # names/shapes we bind already match what the sampler reports.
-      if self._config.scan_layers:
-        params_state = raiden_unscan.unscan_layers(
+      if self._use_weight_converter:
+        if self._weight_converter is None:
+          from maxtext.integration.vllm.weight_converter import WeightConverter  # pylint: disable=g-import-not-at-top,import-outside-toplevel
+          self._weight_converter = WeightConverter(
+              config=self._config,
+              rollout_backend=self._rollout_backend,
+              debug=getattr(self._config, "weight_sync_debug", False),
+          )
+        params_state = self._weight_converter.convert(params_state)
+        gc.collect()
+      else:
+        # 2a. The trainer keeps float32 master weights, but the rollout side
+        # (MaxTextForCausalLM under configs/inference/vllm.yml) loads/serves in
+        # bfloat16 -- Raiden's manifest preflight rejects a dtype/item_size
+        # mismatch, and binding mismatched-dtype buffers would be wrong anyway.
+        # Cast the synced copy down; the trainer's own params_state (used for
+        # the actual optimizer step) is untouched since this is a fresh tree.
+        params_state = jax.tree_util.tree_map(
+            lambda x: x.astype(jnp.bfloat16) if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating) else x,
             params_state,
-            num_layers=self._config.num_decoder_layers,
-            scan_axis=self._config.param_scan_axis,
         )
+
+        # 2b. The trainer runs scanned (scan_layers=True) for training speed, but
+        # the rollout side loads its MaxText model unscanned (MaxTextForCausalLM
+        # under configs/inference/vllm.yml has scan_layers=False). Raiden matches
+        # tensors by name, so unscan here -- on the trainer side only -- so the
+        # names/shapes we bind already match what the sampler reports.
+        if self._config.scan_layers:
+          params_state = raiden_unscan.unscan_layers(
+              params_state,
+              num_layers=self._config.num_decoder_layers,
+              scan_axis=self._config.param_scan_axis,
+          )
 
       # 3. Bind parameters to the Raiden transport, one chunk at a time (see
       # _split_into_chunks) -- construct the per-chunk synchronizers once,
@@ -1284,12 +1340,15 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
 
       chunks = self._split_into_chunks(params_state, num_chunks) if num_chunks > 1 else [params_state]
       del params_state
+      gc.collect()
 
       verify_weights = os.environ.get("VERIFY_WEIGHTS", "").lower() == "true"
       all_metadata = []
       total_variables = 0
       for chunk_idx, (sync, chunk_state) in enumerate(zip(self._raiden_syncs, chunks)):
         sync.bind(chunk_state)
+        del chunk_state
+        gc.collect()
 
         # 4. Initiate Device-to-Host transfer to stage this chunk for network
         # transfer before moving on to the next chunk.
@@ -1302,6 +1361,10 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
         metadata = sync.work_unit_metadata()
         total_variables += len(metadata.variables)
         all_metadata.append(metadata)
+        sync.release_host_arrays()
+
+      gc.collect()
+      _malloc_trim()
 
       logging.info(
           "Trainer prepared weight sync for step %d: registered %d variables across %d chunk(s) on mesh %s",
@@ -1310,6 +1373,8 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
           num_chunks,
           all_metadata[0].mesh_axes if all_metadata else None,
       )
+      self._last_staged_step = self.train_step
+      self._staged_metadata = all_metadata
       return all_metadata
 
     # Unknown transport: raise rather than return empty metadata. A typo would otherwise
@@ -1323,6 +1388,8 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       for sync in self._raiden_syncs:
         logging.vlog(1, "Trainer Raiden metrics: %s", sync.metrics())
         sync.release_host_arrays()
+    gc.collect()
+    _malloc_trim()
     return True
 
   def close(self) -> None:
@@ -1332,6 +1399,8 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
         if hasattr(sync, "close"):
           sync.close()
       self._raiden_syncs = None
+    self._last_staged_step = None
+    self._staged_metadata = None
 
     self.save_checkpoint(metadata=None, force=True)
     self._checkpoint_manager.close()
