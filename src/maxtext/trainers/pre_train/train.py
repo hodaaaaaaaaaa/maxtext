@@ -42,7 +42,6 @@ from jax.sharding import NamedSharding
 
 from flax import linen as nn, nnx, traverse_util
 from flax.linen import partitioning as nn_partitioning
-from flax.nnx import variablelib
 
 from maxtext.configs import pyconfig
 from maxtext.configs.types import TeCommGemmOverlapPolicy
@@ -508,7 +507,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
           is_train=True,
       )
     else:
-      owg_type = variablelib.variable_type_from_name("_overwrite_with_gradient", allow_register=True)
+      owg_type = maxtext_utils_nnx.overwrite_with_gradient_type()
       custom_param_filter = nnx.Any(owg_type)
       train_param_type = (
           getattr(nnx, "LoRAParam", nnx.Param)
@@ -554,7 +553,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       def diff_wrapper(curr_params, custom_params, rest, config, data):
         local_model = nnx.merge(model_graphdef, curr_params, custom_params, rest, copy=True)
         loss, aux = loss_fn(local_model, config, data, None, None, is_train=True)
-        non_param_rest = nnx.state(local_model, nnx.Not(nnx.Any(nnx.Param, nnx.Intermediate)))
+        non_param_rest = maxtext_utils_nnx.state_to_copy_back(local_model)
         return loss, (aux, non_param_rest)
 
       grad_func = jax.value_and_grad(diff_wrapper, argnums=(0, 1), has_aux=True)

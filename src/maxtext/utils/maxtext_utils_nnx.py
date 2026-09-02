@@ -17,6 +17,7 @@ from functools import partial
 from typing import Callable
 
 from flax import nnx
+from flax.nnx import variablelib
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -24,6 +25,28 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from maxtext.utils import max_logging
 from maxtext.configs import pyconfig
 from maxtext.common.common_types import MODEL_MODE_TRAIN
+
+
+def overwrite_with_gradient_type() -> type[nnx.Variable]:
+  """Returns the NNX variable type Flax gives the `_overwrite_with_gradient` collection."""
+  return variablelib.variable_type_from_name("_overwrite_with_gradient", allow_register=True)
+
+
+def state_to_copy_back(model: nnx.Module) -> nnx.State:
+  """Returns the traced model's state that a gradient step must copy back.
+
+  This is everything the optimizer does not own, minus the overwrite-with-gradient
+  variables. Those are updated from their own gradients instead, and `nnx.State.merge`
+  lets its later argument win, so carrying the stale copies here would discard every
+  fp8 amax and scale update and pin delayed scaling to its initial value.
+
+  Args:
+    model: the traced model to read state from.
+
+  Returns:
+    The NNX state to merge with the overwrite-with-gradient gradients.
+  """
+  return nnx.state(model, nnx.Not(nnx.Any(nnx.Param, nnx.Intermediate, overwrite_with_gradient_type())))
 
 
 def create_nnx_rngs(

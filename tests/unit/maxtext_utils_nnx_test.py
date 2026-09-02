@@ -25,6 +25,7 @@ from jax.experimental import mesh_utils
 
 from maxtext.common.common_types import MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_TRAIN
 from flax import traverse_util
+from maxtext.layers import linears, quantizations
 from maxtext.utils import maxtext_utils_nnx
 
 
@@ -387,6 +388,66 @@ class TestReshardAligned(unittest.TestCase):
     # lora_a kernel should retain target/ShardedValue object (ignoring the ShapeDtypeStruct)
     lora_a_kernel = res["decoder"]["layers"]["self_attention"]["lora_a"]["kernel"]
     self.assertIsInstance(lora_a_kernel, ShardedValue)
+
+
+def _paths(state) -> set[str]:
+  return {".".join(str(k) for k in path) for path, _ in nnx.to_flat_state(state)}
+
+
+class StateToCopyBackTest(unittest.TestCase):
+  """Overwrite-with-gradient variables must not ride along in the carried state.
+
+  Flax updates them from their own gradients rather than through the optimizer, so if
+  they were carried back too, `nnx.State.merge` would let the stale copies win and fp8
+  delayed scaling would never see a new amax or scale.
+  """
+
+  def _dense(self, quant):
+    return linears.DenseGeneral(
+        in_features_shape=8, out_features_shape=4, quant=quant, rngs=nnx.Rngs(params=0, dropout=1, aqt=2)
+    )
+
+  def _fp8_dense(self):
+    dense = self._dense(quantizations.Fp8Quantization())
+    dense(jnp.ones((2, 8), jnp.float32))  # materialize the bridged amax and scale variables
+    return dense
+
+  def test_fp8_model_has_overwrite_with_gradient_variables(self):
+    """The premise the other tests rest on."""
+    owg = maxtext_utils_nnx.overwrite_with_gradient_type()
+    self.assertNotEqual(_paths(nnx.state(self._fp8_dense(), owg)), set())
+
+  def test_carried_state_excludes_them(self):
+    dense = self._fp8_dense()
+    owg_paths = _paths(nnx.state(dense, maxtext_utils_nnx.overwrite_with_gradient_type()))
+    carried = _paths(maxtext_utils_nnx.state_to_copy_back(dense))
+    self.assertEqual(owg_paths & carried, set(), "the optimizer does not own these, but their gradients do")
+
+  def test_merge_keeps_the_gradient_values(self):
+    """The end of the train step: gradients must survive the merge, not the stale copies."""
+    dense = self._fp8_dense()
+    owg = maxtext_utils_nnx.overwrite_with_gradient_type()
+    grads = jax.tree.map(lambda x: jnp.full_like(x, 99.0), nnx.state(dense, owg))
+
+    merged = nnx.State.merge(grads, maxtext_utils_nnx.state_to_copy_back(dense))
+
+    for path, variable in nnx.to_flat_state(merged):
+      if ".".join(str(k) for k in path) in _paths(grads):
+        value = variable.get_value() if hasattr(variable, "get_value") else variable
+        self.assertTrue(jnp.all(jnp.asarray(value) == 99.0), "State.merge dropped the overwrite-with-gradient update")
+
+  def test_other_non_param_state_is_still_carried(self):
+    """Only the overwrite-with-gradient variables are dropped; RNG state still rides along."""
+    dense = self._dense(quantizations.AqtQuantization(quant_dg=None, quant_mode=None))
+    rng_paths = _paths(nnx.state(dense, nnx.RngState))
+    self.assertNotEqual(rng_paths, set(), "an AQT-quantized layer keeps its bridge RNGs")
+    self.assertTrue(rng_paths <= _paths(maxtext_utils_nnx.state_to_copy_back(dense)))
+
+  def test_no_effect_without_such_variables(self):
+    """Models with no fp8 variables see the same state as the plain non-param filter."""
+    dense = self._dense(None)
+    plain = nnx.state(dense, nnx.Not(nnx.Any(nnx.Param, nnx.Intermediate)))
+    self.assertEqual(_paths(maxtext_utils_nnx.state_to_copy_back(dense)), _paths(plain))
 
 
 if __name__ == "__main__":
