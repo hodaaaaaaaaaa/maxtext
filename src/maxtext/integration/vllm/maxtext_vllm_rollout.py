@@ -453,6 +453,17 @@ class MaxTextVllmSampler(VllmSampler):
     self._direct_maxtext_sync = direct_maxtext_sync
     self._scan_axis = scan_axis
     self._layer_pattern_length = layer_pattern_length
+    model_config = getattr(config, "model_config", None)
+    model_name = getattr(model_config, "model", "") or ""
+    architectures = getattr(model_config, "architectures", []) or []
+    hf_config = getattr(model_config, "hf_config", None)
+    model_type = getattr(hf_config, "model_type", "") or ""
+    arch_str = " ".join(str(a) for a in architectures)
+    self._is_gemma = (
+        "gemma" in str(model_name).lower()
+        or "gemma" in str(model_type).lower()
+        or "gemma" in str(arch_str).lower()
+    )
 
   def update_params(
       self,
@@ -460,7 +471,7 @@ class MaxTextVllmSampler(VllmSampler):
       filter_types: Optional[Tuple[Any, ...]] = None,
   ):
     """Update the vLLM runner weights from a MaxText state tree."""
-    if self._direct_maxtext_sync:
+    if self._direct_maxtext_sync and self._is_gemma:
       updated_weights = unroll_gemma_scanned_weights(updated_weights)
     try:
       return super().update_params(updated_weights, filter_types)
