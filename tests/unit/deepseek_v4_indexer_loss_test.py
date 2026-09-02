@@ -73,7 +73,6 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
       use_indexer=True,
       indexer_loss_scaling_factor=0.5,
       indexer_sparse_training=False,
-      mla_qk_head_chunk_size=0,
       indexer_topk=None,
   ):
     """Constructs a test MaxTextConfig with CSA indexer configuration."""
@@ -88,7 +87,6 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         f"use_indexer={use_indexer}",
         f"indexer_loss_scaling_factor={indexer_loss_scaling_factor}",
         f"indexer_sparse_training={indexer_sparse_training}",
-        f"mla_qk_head_chunk_size={mla_qk_head_chunk_size}",
         f"max_target_length={self.seq_len}",
         f"indexer_topk={topk}",
         f"indexer_n_heads={self.indexer_n_heads}",
@@ -204,47 +202,6 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         scaling_factor=1.0,
     )
     np.testing.assert_allclose(float(loss), 0.0, atol=1e-5)
-
-  def test_csa_indexer_loss_head_chunking_parity(self):
-    """Test that head chunking scan produces bitwise identical loss to native einsum."""
-    config_chunked = self._get_config(mla_qk_head_chunk_size=2)
-    config_native = self._get_config(mla_qk_head_chunk_size=0)
-    attn_chunked = self._init_csa_attention(config_chunked)
-    attn_native = self._init_csa_attention(config_native)
-
-    n_windows = self.seq_len // self.compress_ratio
-    rng = jax.random.PRNGKey(42)
-    k1, k2, k3 = jax.random.split(rng, 3)
-    query = jax.random.normal(
-        k1, (self.batch_size, self.seq_len, config_chunked.num_query_heads, config_chunked.head_dim)
-    )
-    compressed_kv = jax.random.normal(
-        k2, (self.batch_size, n_windows, config_chunked.num_kv_heads, config_chunked.head_dim)
-    )
-    indexer_score = jax.random.normal(k3, (self.batch_size, self.seq_len, n_windows))
-    compressed_mask = jnp.zeros((self.batch_size, 1, self.seq_len, n_windows))
-
-    loss_chunked = attn_chunked.calculate_csa_indexer_loss(
-        indexer_score=indexer_score,
-        query=query,
-        compressed_kv=compressed_kv,
-        compressed_mask=compressed_mask,
-        segment_mask=None,
-        position_ids=None,
-        sparse_loss=False,
-        scaling_factor=1.0,
-    )
-    loss_native = attn_native.calculate_csa_indexer_loss(
-        indexer_score=indexer_score,
-        query=query,
-        compressed_kv=compressed_kv,
-        compressed_mask=compressed_mask,
-        segment_mask=None,
-        position_ids=None,
-        sparse_loss=False,
-        scaling_factor=1.0,
-    )
-    np.testing.assert_allclose(float(loss_chunked), float(loss_native), rtol=1e-5, atol=1e-5)
 
   def test_csa_indexer_gradients_flow(self):
     """Test that gradients flow to indexer parameters and do not leak into main projections or inputs."""

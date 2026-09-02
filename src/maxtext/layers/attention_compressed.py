@@ -665,7 +665,7 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
 
 
 class DeepseekV4Indexer(nnx.Module):
-  """Indexer module for Compressed Sparse Attention (DeepSeek-V4 paper §2.3.1).
+  """Indexer module for Compressed Sparse Attention (DeepSeek-V4 paper Section 2.3.1).
 
   Evaluates query representations against compressed KV blocks to identify the top-k
   most relevant blocks to attend to.
@@ -926,7 +926,7 @@ class DeepseekV4Indexer(nnx.Module):
 
 
 class DeepseekV4CSACompressor(BaseDeepseekCompressor):
-  """Compressed Sparse Attention compressor (DeepSeek-V4 paper §2.3.1).
+  """Compressed Sparse Attention compressor (DeepSeek-V4 paper Section 2.3.1).
 
   Uses overlapping windows to compress local sequence contexts into sparse blocks,
   which are dynamically selected by the Indexer for long-range sparse attention.
@@ -1797,7 +1797,7 @@ class CompressedAttention(Attention):
     if compressed_kv is None or indexer_score is None:
       return jnp.array(0.0, dtype=jnp.float32)
 
-    batch, q_len, heads, dim = query.shape
+    batch, q_len, _, _ = query.shape
     compressed_len = compressed_kv.shape[1]
     if compressed_len == 0:
       return jnp.array(0.0, dtype=jnp.float32)
@@ -1859,39 +1859,16 @@ class CompressedAttention(Attention):
     log_indexer_probs = jax.nn.log_softmax(safe_student_scores.astype(jnp.float32), axis=-1)
     log_indexer_probs = jnp.where(valid_tokens_mask[:, :, None], log_indexer_probs, 0.0)
 
-    # Chunk across the 'heads' dimension manually using jax.lax.scan if configured
-    head_chunk_size = getattr(self.config, "mla_qk_head_chunk_size", 0)
-    if head_chunk_size > 0:
-      num_chunks = heads // head_chunk_size
-      q_h = query.transpose(2, 0, 1, 3).reshape(num_chunks, head_chunk_size, batch, q_len, dim)
+    # Query is already scaled by softmax_scale in compressed_query_projection; do not scale again
+    attention_scores = jnp.einsum("bthd, bwd -> bhtw", query, k_vec, precision=self.config.matmul_precision)
+    attention_scores = attention_scores + c_mask
 
-      def scan_body_heads(carry, xs):
-        q_c = xs["q"]  # [h_chunk, b, t, d]
-        # Query is already scaled by softmax_scale in compressed_query_projection; do not scale again
-        attn_chunk = jnp.einsum("hbtd, bwd -> bhtw", q_c, k_vec, precision=self.config.matmul_precision)
-        attn_chunk = attn_chunk + c_mask
-
-        # Apply NaN shielding for pre-block tokens
-        safe_attn = jnp.where(valid_tokens_mask[:, None, :, None], attn_chunk, 0.0)
-        probs_chunk = jax.nn.softmax(safe_attn.astype(jnp.float32), axis=-1)
-        probs_chunk = jnp.where(valid_tokens_mask[:, None, :, None], probs_chunk, 0.0)
-        probs_chunk_sum = jnp.sum(probs_chunk, axis=1)  # [b, t, w]
-
-        return carry + probs_chunk_sum, None
-
-      init_probs = jnp.zeros((batch, q_len, compressed_len), dtype=jnp.float32)
-      target_probs, _ = jax.lax.scan(scan_body_heads, init_probs, {"q": q_h})
-    else:
-      # Query is already scaled by softmax_scale in compressed_query_projection; do not scale again
-      attention_scores = jnp.einsum("bthd, bwd -> bhtw", query, k_vec, precision=self.config.matmul_precision)
-      attention_scores = attention_scores + c_mask
-
-      # Apply NaN shielding for pre-block tokens
-      safe_scores = jnp.where(valid_tokens_mask[:, None, :, None], attention_scores, 0.0)
-      raw_probs = jax.nn.softmax(safe_scores.astype(jnp.float32), axis=-1)
-      raw_probs = jnp.where(valid_tokens_mask[:, None, :, None], raw_probs, 0.0)
-      target_probs = jnp.sum(raw_probs, axis=1)
-      target_probs = jax.lax.optimization_barrier(target_probs)
+    # Apply NaN shielding for pre-block tokens
+    safe_scores = jnp.where(valid_tokens_mask[:, None, :, None], attention_scores, 0.0)
+    raw_probs = jax.nn.softmax(safe_scores.astype(jnp.float32), axis=-1)
+    raw_probs = jnp.where(valid_tokens_mask[:, None, :, None], raw_probs, 0.0)
+    target_probs = jnp.sum(raw_probs, axis=1)
+    target_probs = jax.lax.optimization_barrier(target_probs)
 
     # L1 normalize aggregated target distribution across compressed blocks
     target_probs = jnp.where(valid_tokens_mask[:, :, None], target_probs, 0.0)
