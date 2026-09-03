@@ -277,6 +277,7 @@ ModelName = Literal[
     "qwen3-vl-2b",
     "qwen3-vl-4b",
     "qwen3-vl-30b-a3b",
+    "cosmos3-nano-reasoner",
     "qwen3-next-80b-a3b",
     "qwen3-omni-30b-a3b",
     "qwen3-custom-30b-a3b",
@@ -1662,15 +1663,15 @@ class HfDataset(BaseModel):
 class GrainDataset(BaseModel):
   """Configuration specific to Grain datasets."""
 
-  grain_train_files: PathStr = Field("", description="Path to Grain training files.")
-  grain_eval_files: PathStr = Field("", description="Path to Grain evaluation files.")
+  grain_train_files: PathStr = Field("", description="Training source specification for the selected Grain file type.")
+  grain_eval_files: PathStr = Field("", description="Evaluation source specification for the selected Grain file type.")
   grain_train_mixture_config_path: PathStr = Field(
       "",
-      description="Path to a JSON file specifying the mixture weights for Grain training data.",
+      description="Path to an ArrayRecord JSON file specifying Grain training mixture weights.",
   )
   grain_file_type: str = Field(
       "arrayrecord",
-      description="File type for Grain data. Supported: arrayrecord, tfrecord, parquet.",
+      description="File type for Grain data. Supported: arrayrecord, tfrecord, parquet, mmap, mmap_npy.",
   )
   grain_use_elastic_iterator: bool = Field(
       False,
@@ -1703,6 +1704,35 @@ class GrainDataset(BaseModel):
       ),
   )
   grain_shuffle_buffer_size: int = Field(100, description="Shuffle buffer size when using Parquet or TFRecord.")
+
+
+class MMapDataset(BaseModel):
+  """Configuration for ``grain_file_type='mmap'`` and ``'mmap_npy'``."""
+
+  mmap_eod_id: int = Field(0, description="EOD token ID already present in the preprocessed Megatron data.")
+  blend_cache_dir: PathStr = Field(
+      "", description="Optional runtime cache for multi-dataset mmap_npy global blend dispatch indices."
+  )
+  blend_index_dir: PathStr = Field(
+      "", description="Optional directory containing pre-generated dataset_index.npy and dataset_sample_index.npy."
+  )
+  reset_attention_mask: bool = Field(
+      True, description="Start a new attention segment and reset positions after every retained EOD boundary."
+  )
+  eod_mask_loss: bool = Field(False, description="Exclude positions whose input token is EOD from the loss.")
+  packing_max_segments_per_sample: int = Field(
+      25,
+      description=(
+          "Short-segment merge divisor: max_target_length // value. Only used with reset_attention_mask=True; "
+          "set <=0 to retain every EOD boundary."
+      ),
+  )
+  mmap_split_sentences: bool = Field(
+      False, description="Whether preprocessing used --split-sentences; enables document-level indexing when true."
+  )
+  mmap_npy_split: str = Field(
+      "", description="mmap_npy split ratio, e.g. '99,1'; training uses split 0 and evaluation uses split 1."
+  )
 
 
 class OlmoGrainDataset(BaseModel):
@@ -3184,6 +3214,7 @@ class MaxTextConfig(
     TfdsDataset,
     HfDataset,
     GrainDataset,
+    MMapDataset,
     OlmoGrainDataset,
     Tokenizer,
     # Inference
@@ -4280,6 +4311,7 @@ class MaxTextConfig(
           "qwen3.5-35b-a3b",
           "qwen3.5-397b-a17b",
           "maxtext-omni-gemma3-qwen3",
+          "cosmos3-nano-reasoner",
       )
       if self.model_name not in valid_mm_models and self.model_name != "default":
         raise ValueError(f"Multimodal is only supported for {valid_mm_models}, not {self.model_name}")
