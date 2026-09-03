@@ -222,9 +222,13 @@ def stitch_and_save_checkpoints(
   final_params = {"params": stitched_inner}
 
   # 5. Save unified parameter tree to output_checkpoint_path
-  max_logging.log(f"Saving stitched checkpoint to: {output_checkpoint_path}")
+  # Normalize "/<step>/items" to "/<step>" so Orbax v1 writes the correct checkpoint root
+  output_checkpoint_dir = epath.Path(output_checkpoint_path)
+  if output_checkpoint_dir.name == "items":
+    output_checkpoint_dir = output_checkpoint_dir.parent
+  max_logging.log(f"Saving stitched checkpoint to: {output_checkpoint_dir}")
   checkpointing.save_params_to_path(
-      output_checkpoint_path,
+      str(output_checkpoint_dir),
       final_params,
       use_ocdbt=config.checkpoint_storage_use_ocdbt,
       use_zarr3=config.checkpoint_storage_use_zarr3,
@@ -257,7 +261,6 @@ def main(argv):
       "vision_model_name",
       "llm_model_name",
       "base_config",
-      "model_name",
   }
   omni_kwargs = {}
   cleaned_argv = []
@@ -297,7 +300,6 @@ def main(argv):
 
   # Initialize MaxText config using standard train.initialize
   config, _ = initialize(cleaned_argv)
-  object.__setattr__(config, "model_name", "maxtext-omni-gemma3-qwen3")
   # Extract paths from command-line arguments or FLAGS
   vision_path = FLAGS.vision_load_path or omni_kwargs.get("vision_load_path")
   llm_path = FLAGS.llm_load_path or omni_kwargs.get("llm_load_path")
