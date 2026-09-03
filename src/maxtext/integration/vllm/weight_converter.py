@@ -390,20 +390,6 @@ class WeightConverter:
 
     return _rekey_to_target(result, target_state)
 
-  def convert_streaming(
-      self,
-      src_pytree: Any,
-      target_state: Any = None,
-      *,
-      groups_per_piece: int = 1,
-  ) -> Iterator[Dict[str, Any]]:
-    """Yields converted weight pieces incrementally in direct MaxText-to-MaxText mode."""
-    if self.rollout_backend == "maxtext" and self.rules is None:
-      return self._direct.convert_streaming(src_pytree, target_state=target_state, groups_per_piece=groups_per_piece)
-    raise NotImplementedError(
-        "convert_streaming is only supported in direct MaxText-to-MaxText mode (rollout_backend='maxtext' and rules=None)."
-    )
-
 
 # ==========================================
 # 4. Registries and Builders
@@ -1216,12 +1202,32 @@ class MaxTextToMaxTextConverter:
     Pure: neither `src_pytree` nor `target_state` is mutated. Leaves are wrapped in nnx.Param.
     """
     if target_state is None:
-      flat_result = {}
-      for piece in self.convert_streaming(src_pytree, target_state=None):
-        flat_result.update(traverse_util.flatten_dict(piece))
+      src_flat = traverse_util.flatten_dict(_to_pure_dict(src_pytree))
+      src_flat, _ = _strip_root(src_flat, "base")
+
+      if self._plan is None:
+        self._plan = self._build_target_free_plan(src_flat)
+        self._groups = _group_plan(self._plan)
+
+      result: Dict[Tuple[Any, ...], Any] = {}
+      for group in self._groups:
+        outs = self._execute_group_target_free(group, src_flat)
+        for k in group.source_keys:
+          src_flat.pop(k, None)
+        for tgt_key, out in outs:
+          result[tgt_key] = out
+        del outs
+
+      del src_flat
+      gc.collect()
+      nested = traverse_util.unflatten_dict(result)
+      del result
       gc.collect()
       _malloc_trim()
-      return traverse_util.unflatten_dict(flat_result)
+      return jax.tree_util.tree_map(
+          lambda x: nnx.Param(x) if not isinstance(x, (nnx.Param, nnx.Variable)) else x,
+          nested,
+      )
 
     src_flat = traverse_util.flatten_dict(_to_pure_dict(src_pytree))
     src_flat, _ = _strip_root(src_flat, "base")
@@ -1311,52 +1317,6 @@ class MaxTextToMaxTextConverter:
         lambda x: nnx.Param(x) if not isinstance(x, (nnx.Param, nnx.Variable)) else x,
         nested,
     )
-
-  def convert_streaming(
-      self,
-      src_pytree: Any,
-      target_state: Any = None,
-      *,
-      groups_per_piece: int = 1,
-  ) -> Iterator[Dict[str, Any]]:
-    """Yields converted rollout weight pieces incrementally for target-free conversion.
-
-    Pure: `src_pytree` is not mutated. Each yielded piece is a nested dict of `nnx.Param`s
-    corresponding to `groups_per_piece` plan groups. Memory is freed piece-by-piece as
-    source keys are consumed.
-    """
-    if target_state is not None:
-      raise NotImplementedError("convert_streaming only supports target-free conversion (target_state=None).")
-
-    src_flat = traverse_util.flatten_dict(_to_pure_dict(src_pytree))
-    src_flat, _ = _strip_root(src_flat, "base")
-
-    if self._plan is None:
-      self._plan = self._build_target_free_plan(src_flat)
-      self._groups = _group_plan(self._plan)
-
-    groups_per_piece = max(1, groups_per_piece)
-    for i in range(0, len(self._groups), groups_per_piece):
-      piece_groups = self._groups[i : i + groups_per_piece]
-      piece_result: Dict[Tuple[Any, ...], Any] = {}
-      for group in piece_groups:
-        outs = self._execute_group_target_free(group, src_flat)
-        for k in group.source_keys:
-          src_flat.pop(k, None)
-        for tgt_key, out in outs:
-          piece_result[tgt_key] = out
-        del outs
-
-      nested = traverse_util.unflatten_dict(piece_result)
-      del piece_result
-      yield jax.tree_util.tree_map(
-          lambda x: nnx.Param(x) if not isinstance(x, (nnx.Param, nnx.Variable)) else x,
-          nested,
-      )
-
-    del src_flat
-    gc.collect()
-    _malloc_trim()
 
 
 def _rekey_to_target(flat_dotted: Dict[str, Any], target_state: Any) -> Dict[str, Any]:

@@ -1507,10 +1507,6 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
           )
         params_state = self._weight_converter.convert(params_state)
       else:
-        # UNCHANGED, deliberately out of scope: this fp32->bf16 cast is an
-        # on-device (HBM, not host RAM) full materialization -- a different
-        # memory pool than the host OOM this plan addresses. Candidate
-        # fast-follow: fold into unscan_layers_streaming's per-piece slicing.
         params_state = jax.tree_util.tree_map(
             lambda x: x.astype(jnp.bfloat16) if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating) else x,
             params_state,
