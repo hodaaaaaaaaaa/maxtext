@@ -57,8 +57,6 @@ import numpy as np
 # same situation. Real buffers are identified by their train step, so this cannot collide.
 EMPTY_METRICS_BUFFER_ID = -1
 
-_RAIDEN_WORKER_INDEX_STRIDE = 10_000  # >> any plausible piece count (dozens-to-low-hundreds of groups)
-
 
 def _malloc_trim() -> None:
   try:
@@ -421,10 +419,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     )
     self._metrics_recorder = metrics_module.MetricsRecorder()
     self._throttler = inflight_throttler.InflightThrottler(config=self._config)
-    self._raiden_syncs: Any = None
-    self._last_staged_step: Optional[int] = None
-    self._staged_metadata: Any = None
-    self._warned_raiden_sync_chunks: bool = False
+    self._raiden_sync: Any = None
     vllm_cfg = getattr(self._config, "vllm", {})
     if isinstance(vllm_cfg, dict):
       vllm_use_wc = vllm_cfg.get("use_weight_converter", False)
@@ -1467,9 +1462,6 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       return nnx.state(model, nnx.Param)
     return self.model
 
-  def _raiden_worker_index(self, piece_idx: int) -> int:
-    return jax.process_index() * _RAIDEN_WORKER_INDEX_STRIDE + piece_idx + 1
-
   def prepare_weight_sync(
       self,
       staging_transport: str = "raiden",
@@ -1499,37 +1491,11 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
             " tunix build that ships it, or select a different staging_transport."
         ) from exc
 
-      if (
-          self._raiden_syncs is not None
-          and self._last_staged_step == self.train_step
-          and self._staged_metadata is not None
-      ):
-        logging.info(
-            "Trainer re-using staged weight sync for step %d (%d variables)",
-            self.train_step,
-            sum(len(m.variables) for m in self._staged_metadata),
-        )
-        return self._staged_metadata
-
-      if self._raiden_syncs is not None:
-        for sync in self._raiden_syncs:
-          sync.release_host_arrays()
-        gc.collect()
-        _malloc_trim()
-
       # 1. Drain all in-flight TPU computations to ensure weights are fully updated
       self._throttler.wait_for_all()
-      gc.collect()
 
       # 2. Extract clean trainable parameters
       params_state = self._get_trainable_params_state()
-      piece_batch = max(1, int(os.environ.get("RAIDEN_STREAM_PIECE_BATCH", "1")))
-      if "RAIDEN_WEIGHT_SYNC_CHUNKS" in os.environ and not self._warned_raiden_sync_chunks:
-        logging.warning(
-            "RAIDEN_WEIGHT_SYNC_CHUNKS is deprecated and no longer affects Raiden staging; "
-            "use RAIDEN_STREAM_PIECE_BATCH instead."
-        )
-        self._warned_raiden_sync_chunks = True
 
       if self._use_weight_converter:
         if self._weight_converter is None:
@@ -1539,7 +1505,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
               rollout_backend=self._rollout_backend,
               debug=getattr(self._config, "weight_sync_debug", False),
           )
-        piece_iter = self._weight_converter.convert_streaming(params_state, groups_per_piece=piece_batch)
+        params_state = self._weight_converter.convert(params_state)
       else:
         # UNCHANGED, deliberately out of scope: this fp32->bf16 cast is an
         # on-device (HBM, not host RAM) full materialization -- a different
@@ -1550,19 +1516,16 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
             params_state,
         )
         if self._config.scan_layers:
-          piece_iter = raiden_unscan.unscan_layers_streaming(
+          params_state = raiden_unscan.unscan_layers(
               params_state,
               num_layers=self._config.num_decoder_layers,
               scan_axis=self._config.param_scan_axis,
-              keys_per_piece=piece_batch,
           )
-        else:
-          piece_iter = iter([params_state])
 
-      del params_state
-      gc.collect()
-
-      # 3. Bind parameters to the Raiden transport.
+      # 3. Bind parameters to the Raiden transport. Construct the synchronizer
+      # once, matching the persistent-instance-per-cycle pattern the rebind
+      # optimization depends on.
+      #
       # Under Pathways (JAX_PLATFORMS=proxy + JAX_BACKEND_TARGET set, same
       # detection tunix's K8sJaxContext.initialize() uses), trainer params
       # are proxy-backed. Raiden must use FFI (weight_synchronizer_ffi) to bind
@@ -1578,65 +1541,33 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
             "compatible tpu_raiden_jax wheel with FFI support is installed."
         )
 
-      if self._raiden_syncs is None:
-        self._raiden_syncs = []
-
-      expected_num_pieces = len(self._raiden_syncs) if self._raiden_syncs else None
-      verify_weights = os.environ.get("VERIFY_WEIGHTS", "").lower() == "true"
-      all_metadata = []
-      total_variables = 0
-
-      for piece_idx, piece in enumerate(piece_iter):
-        if piece_idx >= len(self._raiden_syncs):
-          self._raiden_syncs.append(
-              raiden_synchronizer.RaidenSynchronizer(
-                  job_name="trainer",
-                  worker_index=self._raiden_worker_index(piece_idx),
-                  auto_h2d=False,
-                  host_stage=is_pathways,
-                  parallelism=4,
-              )
-          )
-
-        sync = self._raiden_syncs[piece_idx]
-        sync.bind(piece)
-        del piece
-        gc.collect()
-
-        # 4. Initiate Device-to-Host transfer to stage this piece for network
-        # transfer before moving on to the next piece.
-        if is_pathways or sync.active:
-          sync.d2h()
-
-        if verify_weights:
-          logging.info("Source weights checksums (piece %d): %s", piece_idx, sync.checksums())
-
-        metadata = sync.work_unit_metadata()
-        total_variables += len(metadata.variables)
-        all_metadata.append(metadata)
-        sync.release_host_arrays()
-
-      num_pieces = len(all_metadata)
-      if expected_num_pieces is not None and num_pieces != expected_num_pieces:
-        raise RuntimeError(
-            f"weight-sync piece count changed from {expected_num_pieces} to {num_pieces} "
-            "between rounds; the cached conversion plan should make this impossible "
-            "unless the model/config changed mid-run."
+      if self._raiden_sync is None:
+        self._raiden_sync = raiden_synchronizer.RaidenSynchronizer(
+            job_name="trainer",
+            worker_index=jax.process_index(),
+            auto_h2d=False,
+            parallelism=4,
         )
 
-      gc.collect()
-      _malloc_trim()
+      self._raiden_sync.bind(params_state)
+      del params_state
 
+      # 4. Initiate Device-to-Host transfer to stage weights for network transfer.
+      if is_pathways or self._raiden_sync.active:
+        self._raiden_sync.d2h()
+
+      verify_weights = os.environ.get("VERIFY_WEIGHTS", "").lower() == "true"
+      if verify_weights:
+        logging.info("Source weights checksums: %s", self._raiden_sync.checksums())
+
+      metadata = self._raiden_sync.work_unit_metadata()
       logging.info(
-          "Trainer prepared weight sync for step %d: registered %d variables across %d piece(s) on mesh %s",
+          "Trainer prepared weight sync for step %d: registered %d variables on mesh %s",
           self.train_step,
-          total_variables,
-          num_pieces,
-          all_metadata[0].mesh_axes if all_metadata else None,
+          len(metadata.variables),
+          metadata.mesh_axes,
       )
-      self._last_staged_step = self.train_step
-      self._staged_metadata = all_metadata
-      return all_metadata
+      return [metadata]
 
     # Unknown transport: raise rather than return empty metadata. A typo would otherwise
     # surface only as the coordinator's "empty side" error, with nothing logged anywhere
@@ -1645,25 +1576,16 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
 
   def release_weight_sync(self, **kwargs: Any) -> Any:
     """Releases staged weight buffers after transfer completion."""
-    self._last_staged_step = None
-    self._staged_metadata = None
-    if self._raiden_syncs:
-      for sync in self._raiden_syncs:
-        logging.vlog(1, "Trainer Raiden metrics: %s", sync.metrics())
-        sync.release_host_arrays()
-    gc.collect()
-    _malloc_trim()
+    if self._raiden_sync:
+      logging.vlog(1, "Trainer Raiden metrics: %s", self._raiden_sync.metrics())
     return True
 
   def close(self) -> None:
     """Closes the trainer, writes buffered metrics and final checkpoint."""
-    if self._raiden_syncs:
-      for sync in self._raiden_syncs:
-        if hasattr(sync, "close"):
-          sync.close()
-      self._raiden_syncs = None
-    self._last_staged_step = None
-    self._staged_metadata = None
+    if self._raiden_sync:
+      if hasattr(self._raiden_sync, "close"):
+        self._raiden_sync.close()
+      self._raiden_sync = None
 
     self.save_checkpoint(metadata=None, force=True)
     self._checkpoint_manager.close()
