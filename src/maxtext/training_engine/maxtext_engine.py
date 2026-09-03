@@ -28,6 +28,7 @@ from typing import Any
 
 from absl import logging
 from flax import nnx
+import flax.struct
 from flax.traverse_util import flatten_dict
 from flax.traverse_util import unflatten_dict
 import jax
@@ -164,7 +165,7 @@ _UNCOMPARABLE_STRUCTURE_HINT = (
 )
 
 
-@dataclasses.dataclass(kw_only=True)
+@flax.struct.dataclass(frozen=True, kw_only=True)
 class RouterReplayTrainerPayload(abstract_engine.TrainerPayload):
   """A TrainerPayload extension carrying forced router-replay expert decisions.
 
